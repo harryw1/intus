@@ -1,4 +1,3 @@
-use std::io;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseEventKind},
     execute,
@@ -8,10 +7,11 @@ use ratatui::{
     backend::{Backend, CrosstermBackend},
     Terminal,
 };
+use std::io;
 use tokio::sync::mpsc;
 
+use ollama_tui::app::{Action, App};
 use ollama_tui::config::Config;
-use ollama_tui::app::{App, Action};
 use ollama_tui::ui::ui;
 
 #[tokio::main]
@@ -28,11 +28,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Load configuration
     let config = Config::load().unwrap_or_else(|e| {
-        eprintln!("Warning: Failed to load config, using defaults. Error: {}", e);
-        Config { 
-            ollama_url: "http://localhost:11434".to_string(), 
+        eprintln!(
+            "Warning: Failed to load config, using defaults. Error: {}",
+            e
+        );
+        Config {
+            ollama_url: "http://localhost:11434".to_string(),
             context_token_limit: 4096,
-            system_prompt: "You are a helpful AI assistant.".to_string()
+            system_prompt: "You are a helpful AI assistant.".to_string(),
         }
     });
 
@@ -43,27 +46,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let tx = action_tx.clone();
         tokio::spawn(async move {
             loop {
-                 if event::poll(std::time::Duration::from_millis(100)).unwrap() {
+                if event::poll(std::time::Duration::from_millis(100)).unwrap() {
                     match event::read().unwrap() {
-                         Event::Key(key) if key.kind == KeyEventKind::Press => {
-                             let _ = tx.send(Action::UserInput(key));
-                         },
-                         Event::Mouse(mouse) => {
-                             match mouse.kind {
-                                 MouseEventKind::ScrollUp => { let _ = tx.send(Action::Scroll(-3)); },
-                                 MouseEventKind::ScrollDown => { let _ = tx.send(Action::Scroll(3)); },
-                                 _ => {}
-                             }
-                         }
-                         Event::Resize(w, h) => {
-                             let _ = tx.send(Action::Resize(w, h));
-                         },
-                         _ => {}
+                        Event::Key(key) if key.kind == KeyEventKind::Press => {
+                            let _ = tx.send(Action::UserInput(key));
+                        }
+                        Event::Mouse(mouse) => match mouse.kind {
+                            MouseEventKind::ScrollUp => {
+                                let _ = tx.send(Action::Scroll(-3));
+                            }
+                            MouseEventKind::ScrollDown => {
+                                let _ = tx.send(Action::Scroll(3));
+                            }
+                            _ => {}
+                        },
+                        Event::Resize(w, h) => {
+                            let _ = tx.send(Action::Resize(w, h));
+                        }
+                        _ => {}
                     }
-                 } else {
-                     // Tick for spinner
-                     let _ = tx.send(Action::Render);
-                 }
+                } else {
+                    // Tick for spinner
+                    let _ = tx.send(Action::Render);
+                }
             }
         })
     };
@@ -75,9 +80,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Restore
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     terminal.show_cursor()?;
-    
+
     // Explicitly abort the input task to ensure the process exits
     input_handle.abort();
 

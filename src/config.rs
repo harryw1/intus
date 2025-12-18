@@ -1,7 +1,7 @@
+use anyhow::Result;
+use directories::{BaseDirs, ProjectDirs};
 use serde::Deserialize;
 use std::fs;
-use directories::ProjectDirs;
-use anyhow::Result;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
@@ -27,17 +27,28 @@ fn default_system_prompt() -> String {
 
 impl Config {
     pub fn load() -> Result<Self> {
-        if let Some(proj_dirs) = ProjectDirs::from("com", "ollama-tui", "ollama-tui") {
-            let config_dir = proj_dirs.config_dir();
-            let config_path = config_dir.join("config.toml");
+        let config_path = if cfg!(target_os = "macos") || cfg!(target_os = "linux") {
+            // Force ~/.config/ollama-tui/config.toml for macOS and Linux
+            BaseDirs::new().map(|base| {
+                base.home_dir()
+                    .join(".config")
+                    .join("ollama-tui")
+                    .join("config.toml")
+            })
+        } else {
+            // Fallback to standard directories for other OSs (like Windows)
+            ProjectDirs::from("com", "ollama-tui", "ollama-tui")
+                .map(|proj_dirs| proj_dirs.config_dir().join("config.toml"))
+        };
 
-            if config_path.exists() {
-                let contents = fs::read_to_string(&config_path)?;
+        if let Some(path) = config_path {
+            if path.exists() {
+                let contents = fs::read_to_string(&path)?;
                 let config: Config = toml::from_str(&contents)?;
                 return Ok(config);
             }
         }
-        
+
         // Return default if file doesn't exist or directories fails
         Ok(Config {
             ollama_url: default_ollama_url(),
