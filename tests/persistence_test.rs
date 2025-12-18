@@ -14,6 +14,7 @@ async fn test_persistence_lifecycle() {
         ollama_url: "dummy".to_string(),
         context_token_limit: 100,
         system_prompt: "Sys".to_string(),
+        ignored_patterns: vec![],
     };
 
     // 2. User sends message

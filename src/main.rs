@@ -36,6 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ollama_url: "http://localhost:11434".to_string(),
             context_token_limit: 4096,
             system_prompt: "You are a helpful AI assistant.".to_string(),
+            ignored_patterns: vec![],
         }
     });
 

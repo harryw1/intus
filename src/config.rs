@@ -11,6 +11,8 @@ pub struct Config {
     pub context_token_limit: usize,
     #[serde(default = "default_system_prompt")]
     pub system_prompt: String,
+    #[serde(default = "default_ignored_patterns")]
+    pub ignored_patterns: Vec<String>,
 }
 
 fn default_ollama_url() -> String {
@@ -23,6 +25,16 @@ fn default_context_token_limit() -> usize {
 
 fn default_system_prompt() -> String {
     "You are a helpful AI assistant.".to_string()
+}
+
+fn default_ignored_patterns() -> Vec<String> {
+    vec![
+        "target".to_string(),
+        ".git".to_string(),
+        "node_modules".to_string(),
+        ".env".to_string(),
+        ".DS_Store".to_string(),
+    ]
 }
 
 impl Config {
@@ -54,6 +66,7 @@ impl Config {
             ollama_url: default_ollama_url(),
             context_token_limit: default_context_token_limit(),
             system_prompt: default_system_prompt(),
+            ignored_patterns: default_ignored_patterns(),
         })
     }
 }

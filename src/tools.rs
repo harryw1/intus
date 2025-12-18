@@ -1,7 +1,23 @@
 use crate::ollama::{ToolDefinition, ToolFunction};
 use anyhow::Result;
+use directories::BaseDirs;
 use serde_json::Value;
 use std::process::Command;
+
+/// Expands `~` at the start of a path to the user's home directory.
+/// Returns the original path if no tilde or home directory not found.
+fn expand_path(path: &str) -> String {
+    let home = BaseDirs::new().map(|b| b.home_dir().to_path_buf());
+    if path == "~" {
+        home.map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.to_string())
+    } else if path.starts_with("~/") {
+        home.map(|p| format!("{}{}", p.to_string_lossy(), &path[1..]))
+            .unwrap_or_else(|| path.to_string())
+    } else {
+        path.to_string()
+    }
+}
 
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
@@ -20,7 +36,9 @@ pub trait Tool: Send + Sync {
     fn execute(&self, args: Value) -> Result<String>;
 }
 
-pub struct FileSearchTool;
+pub struct FileSearchTool {
+    pub ignored_patterns: Vec<String>,
+}
 
 impl Tool for FileSearchTool {
     fn name(&self) -> &str {
@@ -54,15 +72,26 @@ impl Tool for FileSearchTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'name' argument"))?;
 
-        let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+        let path = expand_path(args.get("path").and_then(|v| v.as_str()).unwrap_or("."));
 
-        // Use -ls to get metadata (permissions, size, time)
-        let output = Command::new("find")
-            .arg(path)
-            .arg("-name")
+        let mut cmd = Command::new("find");
+        cmd.arg(path);
+        
+        // Ignore patterns using -not -path
+        for ignore in &self.ignored_patterns {
+            cmd.arg("-not");
+            cmd.arg("-path");
+            cmd.arg(format!("*/{}/*", ignore));
+            cmd.arg("-not");
+            cmd.arg("-path");
+            cmd.arg(format!("*/{}", ignore)); // matches exact dir/file name end
+        }
+
+        cmd.arg("-name")
             .arg(name)
-            .arg("-ls")
-            .output()?;
+            .arg("-ls");
+
+        let output = cmd.output()?;
 
         if !output.status.success() {
             return Err(anyhow::anyhow!(
@@ -86,7 +115,9 @@ impl Tool for FileSearchTool {
     }
 }
 
-pub struct ListDirectoryTool;
+pub struct ListDirectoryTool {
+    pub ignored_patterns: Vec<String>,
+}
 
 impl Tool for ListDirectoryTool {
     fn name(&self) -> &str {
@@ -110,20 +141,36 @@ impl Tool for ListDirectoryTool {
     }
 
     fn execute(&self, args: Value) -> Result<String> {
-        let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+        let path = expand_path(args.get("path").and_then(|v| v.as_str()).unwrap_or("."));
 
-        let output = Command::new("ls").arg("-la").arg(path).output()?;
+        let mut cmd = Command::new("find");
+        cmd.arg(path);
+        cmd.arg("-maxdepth").arg("1");
+
+        // Ignore patterns
+        for ignore in &self.ignored_patterns {
+            cmd.arg("-not");
+            cmd.arg("-path");
+            cmd.arg(format!("*/{}/*", ignore));
+            cmd.arg("-not");
+            cmd.arg("-path");
+            cmd.arg(format!("*/{}", ignore));
+        }
+
+        cmd.arg("-ls");
+
+        let output = cmd.output()?;
 
         if !output.status.success() {
             return Err(anyhow::anyhow!(
-                "ls command failed: {}",
+                "List directory failed: {}",
                 String::from_utf8_lossy(&output.stderr)
             ));
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         if stdout.trim().is_empty() {
-            Ok("Directory is empty.".to_string())
+            Ok("Directory is empty or all items ignored.".to_string())
         } else {
             let lines: Vec<&str> = stdout.lines().take(50).collect();
             let result = lines.join("\n");
@@ -136,7 +183,9 @@ impl Tool for ListDirectoryTool {
     }
 }
 
-pub struct GrepTool;
+pub struct GrepTool {
+    pub ignored_patterns: Vec<String>,
+}
 
 impl Tool for GrepTool {
     fn name(&self) -> &str {
@@ -174,7 +223,7 @@ impl Tool for GrepTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'pattern' argument"))?;
 
-        let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+        let path = expand_path(args.get("path").and_then(|v| v.as_str()).unwrap_or("."));
         let recursive = args
             .get("recursive")
             .and_then(|v| v.as_bool())
@@ -186,6 +235,14 @@ impl Tool for GrepTool {
         if recursive {
             cmd.arg("-r");
         }
+
+        // Ignore patterns
+        for ignore in &self.ignored_patterns {
+            cmd.arg(format!("--exclude-dir={}", ignore));
+            cmd.arg(format!("--exclude={}", ignore));
+            cmd.arg(format!("--exclude={}/*", ignore)); // exclude files inside ignored dir if exclude-dir fails (though -r handles directories)
+        }
+
         cmd.arg(pattern);
         cmd.arg(path);
 
@@ -207,7 +264,9 @@ impl Tool for GrepTool {
     }
 }
 
-pub struct CatTool;
+pub struct CatTool {
+    pub ignored_patterns: Vec<String>,
+}
 
 impl Tool for CatTool {
     fn name(&self) -> &str {
@@ -232,13 +291,24 @@ impl Tool for CatTool {
     }
 
     fn execute(&self, args: Value) -> Result<String> {
-        let path = args
+        let raw_path = args
             .get("path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'path' argument"))?;
+        let path = expand_path(raw_path);
 
         if path.contains("..") {
             return Err(anyhow::anyhow!("Security: '..' not allowed"));
+        }
+
+        // Check if path contains any ignored pattern
+        for ignore in &self.ignored_patterns {
+             if path.contains(ignore) {
+                 // Simple check: if the path has the ignored pattern as a component
+                 // e.g. "target/debug" contains "target".
+                 // A more robust check would split components, but this is a "safe" heuristic for now.
+                 return Err(anyhow::anyhow!("Access denied: Path contains ignored pattern '{}'", ignore));
+             }
         }
 
         let output = Command::new("cat").arg(path).output()?;
@@ -271,7 +341,7 @@ mod tests {
         let file_path = dir.path().join("test_search.txt");
         File::create(&file_path)?;
 
-        let tool = FileSearchTool;
+        let tool = FileSearchTool { ignored_patterns: vec![] };
         let args = serde_json::json!({
             "name": "test_search.txt",
             "path": dir.path().to_str().unwrap()
@@ -288,7 +358,7 @@ mod tests {
         let file_path = dir.path().join("test_ls.txt");
         File::create(&file_path)?;
 
-        let tool = ListDirectoryTool;
+        let tool = ListDirectoryTool { ignored_patterns: vec![] };
         let args = serde_json::json!({ "path": dir.path().to_str().unwrap() });
 
         let output = tool.execute(args)?;
@@ -303,7 +373,7 @@ mod tests {
         let mut file = File::create(&file_path)?;
         writeln!(file, "Hello Tool World")?;
 
-        let tool = CatTool;
+        let tool = CatTool { ignored_patterns: vec![] };
         let args = serde_json::json!({ "path": file_path.to_str().unwrap() });
 
         let output = tool.execute(args)?;
@@ -318,7 +388,7 @@ mod tests {
         let mut file = File::create(&file_path)?;
         writeln!(file, "Line 1\nMatchThis\nLine 3")?;
 
-        let tool = GrepTool;
+        let tool = GrepTool { ignored_patterns: vec![] };
         let args = serde_json::json!({
             "pattern": "MatchThis",
             "path": dir.path().to_str().unwrap()

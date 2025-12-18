@@ -6,12 +6,39 @@ use directories::{BaseDirs, ProjectDirs};
 use futures::StreamExt;
 use ratatui::style::Style;
 use std::collections::HashMap;
+use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use throbber_widgets_tui::ThrobberState;
 use tokio::sync::mpsc;
 use tui_textarea::{Input, TextArea};
+
+/// Generates system context information for the LLM to understand the user's environment.
+fn get_system_context() -> String {
+    let os = if cfg!(target_os = "macos") {
+        "macOS"
+    } else if cfg!(target_os = "linux") {
+        "Linux"
+    } else if cfg!(target_os = "windows") {
+        "Windows"
+    } else {
+        "Unknown OS"
+    };
+
+    let home_dir = BaseDirs::new()
+        .map(|b| b.home_dir().to_string_lossy().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let cwd = env::current_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+
+    format!(
+        "\n\n[System Info]\nOS: {}\nHome Directory: {}\nCurrent Working Directory: {}\n\nWhen using file system tools, use these actual paths instead of guessing. For example, use '{}' instead of '/home/user'.",
+        os, home_dir, cwd, home_dir
+    )
+}
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum Action {
@@ -48,6 +75,7 @@ pub enum Action {
     StartPullModel(String),
     PullProgress(String, Option<u64>, Option<u64>), // Status, Completed, Total
     DeleteModel(String),
+    PrepareQuit,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -90,6 +118,8 @@ pub struct App<'a> {
     pub pull_progress: Option<(String, Option<u64>, Option<u64>)>,
     // Tools
     pub tools: HashMap<String, Arc<dyn Tool>>,
+    // Persistence
+    last_save_time: std::time::Instant,
 }
 
 impl<'a> App<'a> {
@@ -105,10 +135,30 @@ impl<'a> App<'a> {
         textarea.set_placeholder_text("Type a message...");
 
         let mut tools: HashMap<String, Arc<dyn Tool>> = HashMap::new();
-        tools.insert("find_files".to_string(), Arc::new(FileSearchTool));
-        tools.insert("grep_files".to_string(), Arc::new(GrepTool));
-        tools.insert("read_file".to_string(), Arc::new(CatTool));
-        tools.insert("list_directory".to_string(), Arc::new(ListDirectoryTool));
+        tools.insert(
+            "find_files".to_string(),
+            Arc::new(FileSearchTool {
+                ignored_patterns: config.ignored_patterns.clone(),
+            }),
+        );
+        tools.insert(
+            "grep_files".to_string(),
+            Arc::new(GrepTool {
+                ignored_patterns: config.ignored_patterns.clone(),
+            }),
+        );
+        tools.insert(
+            "read_file".to_string(),
+            Arc::new(CatTool {
+                ignored_patterns: config.ignored_patterns.clone(),
+            }),
+        );
+        tools.insert(
+            "list_directory".to_string(),
+            Arc::new(ListDirectoryTool {
+                ignored_patterns: config.ignored_patterns.clone(),
+            }),
+        );
 
         let mut app = Self {
             ollama_client: OllamaClient::new(config.ollama_url),
@@ -136,6 +186,7 @@ impl<'a> App<'a> {
             pull_input: TextArea::default(),
             pull_progress: None,
             tools,
+            last_save_time: std::time::Instant::now(),
         };
 
         if load_history {
@@ -175,12 +226,13 @@ impl<'a> App<'a> {
         // Restore chronological order
         context_messages.reverse();
 
-        // Prepend system prompt
+        // Prepend system prompt with system context
+        let full_system_prompt = format!("{}{}", self.system_prompt, get_system_context());
         context_messages.insert(
             0,
             ChatMessageRequest {
                 role: "system".to_string(),
-                content: self.system_prompt.clone(),
+                content: full_system_prompt,
                 images: None,
                 tool_calls: None,
             },
@@ -262,8 +314,27 @@ impl<'a> App<'a> {
     fn save_session(&self) {
         if let Some(path) = self.get_session_path(&self.current_session) {
             if let Ok(json) = serde_json::to_string(&self.messages) {
-                let _ = fs::write(path, json);
+                // Create backup of existing session before overwriting
+                if path.exists() {
+                    let backup_path = path.with_extension("json.bak");
+                    let _ = fs::copy(&path, &backup_path);
+                }
+                // Atomic write: write to temp file, then rename
+                let temp_path = path.with_extension("json.tmp");
+                if fs::write(&temp_path, &json).is_ok() {
+                    let _ = fs::rename(&temp_path, &path);
+                }
             }
+        }
+    }
+
+    /// Throttled save - at most once every 2 seconds during streaming.
+    /// Reduces I/O overhead when receiving many tokens.
+    fn save_session_throttled(&mut self) {
+        let now = std::time::Instant::now();
+        if now.duration_since(self.last_save_time).as_secs() >= 2 {
+            self.save_session();
+            self.last_save_time = now;
         }
     }
 
@@ -476,7 +547,7 @@ impl<'a> App<'a> {
                 if self.auto_scroll {
                     self.scroll_to_bottom();
                 }
-                self.save_session();
+                self.save_session_throttled();
                 true
             }
             Action::AddToolCall(tool_call) => {
@@ -740,7 +811,7 @@ impl<'a> App<'a> {
                                 let _ = self.action_tx.send(Action::SwitchMode(Mode::Insert));
                             }
                             KeyCode::Char('q') => {
-                                let _ = self.action_tx.send(Action::Quit);
+                                let _ = self.action_tx.send(Action::PrepareQuit);
                             }
                             KeyCode::Char('j') | KeyCode::Down => {
                                 self.vertical_scroll = self.vertical_scroll.saturating_add(1);
@@ -880,6 +951,11 @@ impl<'a> App<'a> {
                 }
                 true
             }
+            Action::PrepareQuit => {
+                self.save_session();
+                let _ = self.action_tx.send(Action::Quit);
+                true
+            }
             _ => false,
         }
     }
@@ -897,6 +973,7 @@ mod tests {
             ollama_url: "http://localhost:11434".to_string(),
             context_token_limit: 4096,
             system_prompt: "You are helpful".to_string(),
+            ignored_patterns: vec![],
         };
         let app = App::new(tx, config, false, None);
 
@@ -912,6 +989,7 @@ mod tests {
             ollama_url: "http://localhost:11434".to_string(),
             context_token_limit: 4096,
             system_prompt: "You are helpful".to_string(),
+            ignored_patterns: vec![],
         };
         let mut app = App::new(tx, config, false, None);
         app.models = vec!["test-model".to_string()]; // Mock models
@@ -938,6 +1016,7 @@ mod tests {
             ollama_url: "http://localhost:11434".to_string(),
             context_token_limit: 4096,
             system_prompt: "You are helpful".to_string(),
+            ignored_patterns: vec![],
         };
         let mut app = App::new(tx, config, false, None);
 
@@ -955,6 +1034,7 @@ mod tests {
             ollama_url: "http://localhost:11434".to_string(),
             context_token_limit: 4096,
             system_prompt: "You are helpful".to_string(),
+            ignored_patterns: vec![],
         };
         let mut app = App::new(tx, config, false, None);
 
@@ -972,6 +1052,7 @@ mod tests {
             ollama_url: "http://localhost:11434".to_string(),
             context_token_limit: 4096,
             system_prompt: "You are helpful".to_string(),
+            ignored_patterns: vec![],
         };
         let mut app = App::new(tx, config, false, None);
 
@@ -990,6 +1071,7 @@ mod tests {
             ollama_url: "http://localhost:11434".to_string(),
             context_token_limit: 4096,
             system_prompt: "You are helpful".to_string(),
+            ignored_patterns: vec![],
         };
         let mut app = App::new(tx, config, false, None);
 
@@ -1006,6 +1088,7 @@ mod tests {
             ollama_url: "http://localhost:11434".to_string(),
             context_token_limit: 4096,
             system_prompt: "You are helpful".to_string(),
+            ignored_patterns: vec![],
         };
         let mut app = App::new(tx, config, false, None);
 
@@ -1033,6 +1116,7 @@ mod tests {
             ollama_url: "http://localhost:11434".to_string(),
             context_token_limit: 4096,
             system_prompt: "You are helpful".to_string(),
+            ignored_patterns: vec![],
         };
         let mut app = App::new(tx, config, false, None);
 
@@ -1092,6 +1176,7 @@ mod tests {
             ollama_url: "http://localhost:11434".to_string(),
             context_token_limit: 4096,
             system_prompt: "You are helpful".to_string(),
+            ignored_patterns: vec![],
         };
         let mut app = App::new(tx, config, false, None);
         app.models = vec!["test".to_string()];
@@ -1120,6 +1205,7 @@ mod tests {
             ollama_url: "http://localhost:11434".to_string(),
             context_token_limit: 4096,
             system_prompt: "You are helpful".to_string(),
+            ignored_patterns: vec![],
         };
         let mut app = App::new(tx, config, false, None);
 
@@ -1142,6 +1228,7 @@ mod tests {
             ollama_url: "http://localhost:11434".to_string(),
             context_token_limit: 4096,
             system_prompt: "You are helpful".to_string(),
+            ignored_patterns: vec![],
         };
         let mut app = App::new(tx, config, false, None);
 
@@ -1184,6 +1271,7 @@ mod tests {
             ollama_url: "http://localhost:11434".to_string(),
             context_token_limit: 12,
             system_prompt: "HI".to_string(),
+            ignored_patterns: vec![],
         };
         let mut app = App::new(tx, config, false, None);
 
