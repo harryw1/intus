@@ -155,6 +155,7 @@ pub struct App<'a> {
     pub notification: Option<(String, std::time::Instant)>,
     pub theme: crate::theme::Theme,
     pub process_tracker: Arc<ProcessTracker>,
+    pub rag: crate::rag::RagSystem,
 }
 
 /// Maximum number of consecutive tool calls before forcing a text response
@@ -229,6 +230,7 @@ impl<'a> App<'a> {
             "web_search".to_string(),
             Arc::new(WebSearchTool {
                 searxng_url: config.searxng_url.clone(),
+                client: std::sync::OnceLock::new(),
             }),
         );
         tools.insert(
@@ -256,7 +258,7 @@ impl<'a> App<'a> {
         );
 
         let mut app = Self {
-            ollama_client: OllamaClient::new(config.ollama_url),
+            ollama_client: OllamaClient::new(config.ollama_url.clone()),
             action_tx,
             messages: Vec::new(),
             input: textarea,
@@ -301,6 +303,10 @@ impl<'a> App<'a> {
             notification: None,
             theme: crate::theme::Theme::default(),
             process_tracker,
+            rag: crate::rag::RagSystem::new(
+                OllamaClient::new(config.ollama_url.clone()),
+                config.embedding_model.clone(),
+            ),
         };
 
         if load_history {
@@ -397,7 +403,7 @@ impl<'a> App<'a> {
                     }
                 ];
                 
-                if let Ok(mut stream) = client.chat(&model, reqs, None).await {
+                if let Ok(mut stream) = client.chat(&model, reqs, None, None).await {
                     let mut summary_acc = String::new();
                     while let Some(res) = stream.next().await {
                          if let Ok(ChatStreamEvent::Token(t)) = res {
@@ -659,7 +665,60 @@ impl<'a> App<'a> {
             self.current_response_buffer.clear();
         }
 
-        let context_messages = self.build_context_window();
+        // 1. Get the last USER message (ignoring the empty assistant placeholder we just pushed)
+        // We look for the last actual content message from the user.
+        let last_user_content = self.messages.iter()
+            .rev()
+            .skip(1) // skip the empty assistant message
+            .find(|m| m.role == "user")
+            .map(|m| m.content.clone());
+
+        // 2. Perform RAG Search if valid user query
+        let cloned_rag = if let Some(query) = last_user_content {
+             // We can't use self.rag directly in the async block easily due to borrow checker
+             // But actually we need the result BEFORE we build context window?
+             // Or we inject it into the message list temporarily?
+             // Let's search synchronously here (blocking the UI briefly is acceptable for now, or we spawn?)
+             // RAG search relies on network (Ollama embedding). We should async it.
+             // BUT `build_context_window` is synchronous.
+             // We need to fetch context, modify the message history (or context window), THEN run chat.
+             // Let's do it inside a separate spawn? No, that complicates state.
+             
+             // Simplest First Implementation:
+             // Block on RAG search. (freeze UI for 100ms-500ms).
+             // Since we are inside `request_ai_response` which is async, we can await!
+             // `request_ai_response` is `async fn`.
+             
+             if let Ok(results) = self.rag.search(&query, 3).await {
+                 if !results.is_empty() {
+                      // Format context
+                      let context_block = format!("\n\n[Relevant Context from Tools]:\n{}", results.join("\n---\n"));
+                      // Inject into the SYSTEM prompt for this turn? Or as a System Message?
+                      // Let's append to the last user message in the CONTEXT ONLY?
+                      // `build_context_window` reads `self.messages`.
+                      // We don't want to modify `self.messages` permanently with this context (it's confusing in UI).
+                      // So we should modify `context_messages` AFTER calling `build_context_window`.
+                      Some(context_block)
+                 } else {
+                     None
+                 }
+             } else {
+                 None
+             }
+        } else {
+            None
+        };
+        
+        let mut context_messages = self.build_context_window();
+        
+        // Inject RAG context if available
+        if let Some(ctx) = cloned_rag {
+             // Find the last user message in context_messages and append context
+             if let Some(msg) = context_messages.iter_mut().rfind(|m| m.role == "user") {
+                  msg.content.push_str(&ctx);
+             }
+        }
+
         let model = self.models[self.selected_model].clone();
         let client = self.ollama_client.clone();
         let tx = self.action_tx.clone();
@@ -673,9 +732,14 @@ impl<'a> App<'a> {
                 None
             };
 
+        let context_limit = self.context_token_limit;
+
         let handle = tokio::spawn(async move {
+            let mut options = std::collections::HashMap::new();
+            options.insert("num_ctx".to_string(), serde_json::json!(context_limit));
+
             match client
-                .chat(&model, context_messages, tool_definitions)
+                .chat(&model, context_messages, tool_definitions, Some(options))
                 .await
             {
                 Ok(mut stream) => {
@@ -999,6 +1063,10 @@ impl<'a> App<'a> {
                 true
             }
             Action::AddToolOutput(name, output) => {
+                // Ingest tool output into RAG
+                let output_clone = output.clone();
+                let _ = self.rag.add_text(&output_clone).await;
+
                 self.messages.push(ChatMessage {
                     role: "tool".to_string(),
                     content: output,

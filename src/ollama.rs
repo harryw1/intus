@@ -334,15 +334,20 @@ impl OllamaClient {
         model: &str,
         messages: Vec<ChatMessageRequest>,
         tools: Option<Vec<ToolDefinition>>,
+        options: Option<HashMap<String, Value>>,
     ) -> Result<impl Stream<Item = Result<ChatStreamEvent, anyhow::Error>>> {
-        let mut options = HashMap::new();
-        options.insert("num_predict".to_string(), serde_json::json!(-1)); // -1 = Infinite generation
+        let mut request_options = HashMap::new();
+        request_options.insert("num_predict".to_string(), serde_json::json!(-1)); // -1 = Infinite generation
+        
+        if let Some(opts) = options {
+            request_options.extend(opts);
+        }
 
         let request = ChatRequest {
             model: model.to_string(),
             messages,
             stream: true,
-            options: Some(options),
+            options: Some(request_options),
             tools,
         };
 
@@ -540,7 +545,7 @@ mod tests {
             tool_name: None,
         }];
         let mut stream = client
-            .chat("llama2", messages, None)
+            .chat("llama2", messages, None, None)
             .await
             .expect("Failed to start chat");
 
@@ -573,7 +578,7 @@ mod tests {
             tool_calls: None,
             tool_name: None,
         }];
-        let result = client.chat("llama2", messages, None).await;
+        let result = client.chat("llama2", messages, None, None).await;
 
         assert!(result.is_err());
     }

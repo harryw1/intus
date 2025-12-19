@@ -610,6 +610,7 @@ fn cosine_similarity(a: &[f64], b: &[f64]) -> f64 {
 
 pub struct WebSearchTool {
     pub searxng_url: String,
+    pub client: std::sync::OnceLock<reqwest::blocking::Client>,
 }
 
 impl Tool for WebSearchTool {
@@ -618,7 +619,7 @@ impl Tool for WebSearchTool {
     }
 
     fn description(&self) -> &str {
-        "USE THIS to search the web for current information, news, documentation, or solutions. Input: query (search terms) and optional category. Uses SearXNG.\n- For news/current events, YOU MUST set category='news'.\n- You can use search operators in your query like 'site:npr.org' or 'filetype:pdf'."
+        "USE THIS to search the web. IMPORTANT:\n- 'query' returns only SNIPPETS. For detailed or factual info (weather, news, coding), you MUST then call this tool again with 'url' to read the actual page.\n- Do NOT hallucinate answers from search results unless you have read the page."
     }
 
     fn parameters(&self) -> Value {
@@ -627,7 +628,11 @@ impl Tool for WebSearchTool {
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "The search query. Be specific."
+                    "description": "The search query. Required if 'url' is not provided."
+                },
+                "url": {
+                    "type": "string",
+                    "description": "The URL to fetch content from. If provided, 'query' is ignored."
                 },
                 "category": {
                     "type": "string",
@@ -635,25 +640,49 @@ impl Tool for WebSearchTool {
                     "description": "The category of search results. Use 'news' for current events, 'it' for programming/technical, 'general' for broad searches. Defaults to 'general'."
                 }
             },
-            "required": ["query"]
+            "required": []
         })
     }
 
     fn execute(&self, args: Value) -> Result<String> {
+        let url_arg = args.get("url").and_then(|v| v.as_str());
+
+        let client = self.client.get_or_init(|| {
+            reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_else(|_| reqwest::blocking::Client::new())
+        });
+        
+        if let Some(url) = url_arg {
+             let response = client.get(url)
+                 .header("User-Agent", "Mozilla/5.0 (compatible; OllamaTui/0.1; +https://github.com/fiesty/ollama-tui)")
+                 .send()?;
+            if !response.status().is_success() {
+                return Err(anyhow::anyhow!("Failed to fetch URL: {}", response.status()));
+            }
+
+            let html = response.text()?;
+            let width = 120; // Reasonable width for TUI reading
+            let text = html2text::from_read(html.as_bytes(), width);
+            
+            // Limit output size
+            if text.len() > 20000 {
+                return Ok(format!("{}\n... (truncated)", &text[..20000]));
+            }
+            return Ok(text);
+        }
+
         let query = args
             .get("query")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'query' argument"))?
+            .ok_or_else(|| anyhow::anyhow!("Missing 'query' argument (or 'url')"))?
             .trim();
 
         let category = args
             .get("category")
             .and_then(|v| v.as_str())
             .unwrap_or("general");
-
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()?;
 
         let mut url = self.searxng_url.clone();
         if !url.ends_with('/') {

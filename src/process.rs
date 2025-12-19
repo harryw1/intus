@@ -1,6 +1,5 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
-use std::io::Write;
 
 /// Thread-safe tracker for child processes spawned by the application.
 #[derive(Debug, Clone, Default)]
@@ -31,14 +30,10 @@ impl ProcessTracker {
     pub fn kill_all(&self) {
         let pids = self.pids.lock().unwrap();
         if pids.is_empty() {
-             let _ = std::fs::OpenOptions::new().append(true).open("debug_log.txt").map(|mut f| writeln!(f, "No processes to kill."));
-            return;
+             return;
         }
 
-        let _ = std::fs::OpenOptions::new().append(true).open("debug_log.txt").map(|mut f| writeln!(f, "Killing {} processes...", pids.len()));
-
         for &pid in pids.iter() {
-             let _ = std::fs::OpenOptions::new().append(true).open("debug_log.txt").map(|mut f| writeln!(f, "Killing PID: {}", pid));
             
             #[cfg(unix)]
             {

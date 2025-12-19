@@ -6,3 +6,4 @@ pub mod process;
 pub mod tools;
 pub mod ui;
 pub mod theme;
+pub mod rag;

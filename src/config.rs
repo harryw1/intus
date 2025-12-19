@@ -41,7 +41,7 @@ fn default_embedding_model() -> String {
 }
 
 fn default_context_token_limit() -> usize {
-    4096
+    131072
 }
 
 fn default_system_prompt() -> String {
@@ -62,7 +62,8 @@ When the user asks you to do something with files or search for something:
 2. Use case_insensitive=true when user asks for case-insensitive search
 3. Use ~ or ~/Documents for user document searches
 4. After getting results, summarize them clearly
-5. Do NOT call the same tool with same arguments twice"#
+5. Do NOT call the same tool with same arguments twice
+6. VERIFY facts by reading the actual file or URL content. Do not guess based on filenames or search snippets."#
         .to_string()
 }
 
