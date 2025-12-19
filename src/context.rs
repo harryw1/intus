@@ -134,28 +134,23 @@ SUMMARY:"#,
 
     /// Apply a summary to the message history, replacing old messages.
     /// Keeps the most recent messages and replaces earlier ones with a summary.
-    pub fn apply_summary(messages: &mut Vec<ChatMessage>, summary: String, keep_recent: usize) {
+    /// Generate a summary of the provided messages.
+    /// Returns the summary string and the number of messages summarized.
+    /// This is NON-DESTRUCTIVE - it does not modify the input messages.
+    pub fn summarize_messages(messages: &[ChatMessage], keep_recent: usize) -> Option<(String, usize)> {
         if messages.len() <= keep_recent {
-            return;
+             return None;
         }
 
-        // Keep the N most recent messages
-        let recent: Vec<_> = messages.drain(messages.len() - keep_recent..).collect();
-
-        // Clear old messages
-        messages.clear();
-
-        // Add summary as a system-injected message
-        messages.push(ChatMessage {
-            role: "system".to_string(),
-            content: format!("[Previous conversation summary]\n{}", summary),
-            images: None,
-            tool_calls: None,
-            tool_name: None,
-        });
-
-        // Add back recent messages
-        messages.extend(recent);
+        let count_to_summarize = messages.len() - keep_recent;
+        if count_to_summarize == 0 {
+            return None;
+        }
+        
+        let messages_to_summarize = &messages[0..count_to_summarize];
+        let prompt = Self::generate_summary_prompt(messages_to_summarize);
+        
+        Some((prompt, count_to_summarize))
     }
 
     /// Build a request for generating a summary
@@ -258,8 +253,8 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_summary() {
-        let mut messages = vec![
+    fn test_summarize_messages() {
+        let messages = vec![
             ChatMessage {
                 role: "user".to_string(),
                 content: "Old message 1".to_string(),
@@ -290,13 +285,13 @@ mod tests {
             },
         ];
 
-        ContextManager::apply_summary(&mut messages, "This is a summary".to_string(), 2);
+        let result = ContextManager::summarize_messages(&messages, 2);
 
-        // Should have summary + 2 recent messages
-        assert_eq!(messages.len(), 3);
-        assert!(messages[0].content.contains("summary"));
-        assert_eq!(messages[1].content, "Recent message");
-        assert_eq!(messages[2].content, "Recent response");
+        // Should have summary string and count=2
+        assert!(result.is_some());
+        let (prompt, count) = result.unwrap();
+        assert_eq!(count, 2);
+        assert!(prompt.contains("Old message 1"));
     }
 
     #[test]

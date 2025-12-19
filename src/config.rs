@@ -131,4 +131,16 @@ impl Config {
             embedding_model: default_embedding_model(),
         })
     }
+    pub fn get_config_dir(&self) -> Option<std::path::PathBuf> {
+        if cfg!(target_os = "macos") || cfg!(target_os = "linux") {
+            BaseDirs::new().map(|base| {
+                base.home_dir()
+                    .join(".config")
+                    .join("ollama-tui")
+            })
+        } else {
+            ProjectDirs::from("com", "ollama-tui", "ollama-tui")
+                .map(|proj_dirs| proj_dirs.config_dir().to_path_buf())
+        }
+    }
 }

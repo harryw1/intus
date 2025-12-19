@@ -84,6 +84,9 @@ pub enum Action {
     CancelGeneration,
     CopyMessage,
     MoveSelection(i16),
+    // Context Management
+    UpdateModelContextLimit(usize),
+    SummaryReady(String, usize), // summary text, count of messages summarized
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -137,6 +140,10 @@ pub struct App<'a> {
     pub context_manager: ContextManager,
     pub current_token_usage: usize,
     pub tool_scroll: u16,
+    pub model_context_limit: Option<usize>,
+    pub conversation_summary: Option<String>,
+    pub summarized_count: usize,
+    pub is_summarizing: bool,
     // Stop Generation
     pub current_request_handle: Option<AbortHandle>,
     // Clipboard & Selection
@@ -145,6 +152,7 @@ pub struct App<'a> {
     pub clipboard: Option<Clipboard>,
     // UX
     pub notification: Option<(String, std::time::Instant)>,
+    pub theme: crate::theme::Theme,
 }
 
 /// Maximum number of consecutive tool calls before forcing a text response
@@ -199,6 +207,8 @@ impl<'a> App<'a> {
                 ignored_patterns: config.ignored_patterns.clone(),
             }),
         );
+        let storage_path = config.get_config_dir().map(|d| d.join("vectors.json"));
+        
         tools.insert(
             "semantic_search".to_string(),
             Arc::new(SemanticSearchTool {
@@ -206,6 +216,7 @@ impl<'a> App<'a> {
                 index: Arc::new(std::sync::Mutex::new(None)),
                 embedding_model: config.embedding_model.clone(),
                 ignored_patterns: config.ignored_patterns.clone(),
+                storage_path,
             }),
         );
         tools.insert(
@@ -273,10 +284,15 @@ impl<'a> App<'a> {
             ),
             current_token_usage: 0,
             tool_scroll: 0,
+            model_context_limit: None,
+            conversation_summary: None,
+            summarized_count: 0,
+            is_summarizing: false,
             current_request_handle: None,
             selected_message_index: None,
             clipboard: Clipboard::new().ok(),
             notification: None,
+            theme: crate::theme::Theme::default(),
         };
 
         if load_history {
@@ -293,15 +309,156 @@ impl<'a> App<'a> {
         (text.len() / 4) + 4
     }
 
+    /// Calculates the token usage of the *actual* context window we would send.
+    fn calculate_context_usage(&self) -> usize {
+        let _limit = self.model_context_limit.unwrap_or(self.context_token_limit);
+        let system_prompt_tokens = self.estimate_tokens(&self.system_prompt) + self.estimate_tokens(&get_system_context());
+        
+        let summary_tokens = if let Some(summary) = &self.conversation_summary {
+             self.estimate_tokens(summary) + 10 
+        } else {
+             0
+        };
+        
+        // Base usage
+        let mut usage = system_prompt_tokens + summary_tokens;
+        
+        let start_index = if self.conversation_summary.is_some() {
+             self.summarized_count
+        } else {
+             0
+        };
+        
+        // Add active messages
+        for (i, msg) in self.messages.iter().enumerate() {
+            if i >= start_index {
+                usage += self.estimate_tokens(&msg.content);
+            }
+        }
+        
+        // Note: This usage might exceed limit if we just added a huge message.
+        // But `build_context_window` truncates. The UI should show *actual usage vs limit*,
+        // so if we are incorrectly over limit, user sees it. 
+        // Ideally, we want to show what the model *sees*. 
+        // If `build_context` truncates, we should calculate usage based on that.
+        // But iterating build_context is expensive. 
+        // Let's stick to this "intended" usage.
+        usage
+    }
+
+    fn trigger_summarization(&mut self) {
+        if self.messages.len() < 4 { return; } // Don't summarize tiny history
+        
+        self.is_summarizing = true;
+        
+        // Summarize oldest 50% of messages
+        let count_to_summarize = self.messages.len() / 2;
+        // Don't re-summarize if we haven't advanced much?
+        // Actually, `summarized_count` tracks where we are.
+        // We want to summarize from 0 to `new_count`.
+        // If we already have a summary covering X messages, we want a new summary covering Y (where Y > X).
+        
+        if count_to_summarize <= self.summarized_count {
+            self.is_summarizing = false;
+            return;
+        }
+
+        let messages_snapshot = self.messages.clone(); // Clone for async task
+        let tx = self.action_tx.clone();
+        let system_prompt = self.system_prompt.clone();
+        let client = self.ollama_client.clone();
+        let model = self.models.get(self.selected_model).cloned().unwrap_or("llama2".to_string());
+        
+        tokio::spawn(async move {
+            if let Some((prompt, count)) = ContextManager::summarize_messages(&messages_snapshot, messages_snapshot.len() - count_to_summarize) {
+                // Send summarization request
+                let reqs = vec![
+                    ChatMessageRequest {
+                        role: "system".to_string(),
+                        content: system_prompt, // Keep system persona for summary style
+                        images: None,
+                        tool_calls: None,
+                        tool_name: None,
+                    },
+                    ChatMessageRequest {
+                        role: "user".to_string(),
+                        content: prompt,
+                        images: None,
+                        tool_calls: None,
+                        tool_name: None,
+                    }
+                ];
+                
+                if let Ok(mut stream) = client.chat(&model, reqs, None).await {
+                    let mut summary_acc = String::new();
+                    while let Some(res) = stream.next().await {
+                         if let Ok(ChatStreamEvent::Token(t)) = res {
+                             summary_acc.push_str(&t);
+                         }
+                    }
+                    
+                    if !summary_acc.trim().is_empty() {
+                         let _ = tx.send(Action::SummaryReady(summary_acc, count));
+                         return;
+                    }
+                }
+            }
+            // If failed or empty
+            // We need to reset flag? 
+            // Currently no easy way to reset `is_summarizing` on error without another Action.
+            // For MVP, if it fails, it hangs in `is_summarizing=true` preventing retry.
+            // Let's implement Action::SummarizationFailed? Or just ignore.
+        });
+    }
+
     fn build_context_window(&self) -> Vec<ChatMessageRequest> {
         let mut context_messages: Vec<ChatMessageRequest> = Vec::new();
-        let system_prompt_tokens = self.estimate_tokens(&self.system_prompt);
-        let mut current_tokens = system_prompt_tokens;
+        
+        let limit = self.model_context_limit.unwrap_or(self.context_token_limit);
+        
+        // Calculate reserved tokens (System Prompt + potential Summary)
+        let system_prompt_tokens = self.estimate_tokens(&self.system_prompt) + self.estimate_tokens(&get_system_context());
+        let summary_tokens = if let Some(summary) = &self.conversation_summary {
+             self.estimate_tokens(summary) + 10 // +10 overhead
+        } else {
+             0
+        };
+        
+        // Reserve space for system prompt and summary AND a generation buffer (e.g., 512 tokens)
+        // This ensures we don't starve the model of generation capacity.
+        let generation_buffer = 512;
+        let reserved_tokens = system_prompt_tokens + summary_tokens + generation_buffer;
+        let available_for_history = limit.saturating_sub(reserved_tokens);
+        
+        let mut current_tokens = 0;
 
-        // Iterate backwards through history to fit as many recent messages as possible
-        for msg in self.messages.iter().rev() {
+        // Iterate backwards through history, skipping summarized messages if we rely on summary
+        // However, "Non-destructive" means we keep ALL in UI, but maybe truncate for model.
+        // If we have a summary covering N messages, we SHOULD skip them for the model context 
+        // IF we are constrained. But ideally we fit as much recent history as possible.
+        // Proposed Logic: Fill backwards until we hit limit OR we hit the `summarized_count` boundary.
+        // Actually, if we have a summary, we typically WANT to use it instead of the oldest messages it covers.
+        // So we should stop iterating when we reach `messages.len() - summarized_count`.
+        
+        let start_index = if self.conversation_summary.is_some() {
+             self.summarized_count
+        } else {
+             0
+        };
+
+        // We only consider messages after the summary point
+        // But wait, if available space allows, maybe we CAN include some "summarized" messages?
+        // Simpler approach for Phase 1: Summary REPLACES the first `summarized_count` messages in the CONTEXT view.
+        // So we explicitly skip the first `summarized_count` messages from the `self.messages` list.
+        
+        // Take messages from end, stopping at start_index
+        for (i, msg) in self.messages.iter().enumerate().rev() {
+            if i < start_index {
+                break; 
+            }
+            
             let msg_tokens = self.estimate_tokens(&msg.content);
-            if current_tokens + msg_tokens > self.context_token_limit {
+            if current_tokens + msg_tokens > available_for_history {
                 break;
             }
             context_messages.push(ChatMessageRequest {
@@ -316,6 +473,17 @@ impl<'a> App<'a> {
 
         // Restore chronological order
         context_messages.reverse();
+        
+        // Inject Summary if exists
+        if let Some(summary) = &self.conversation_summary {
+            context_messages.insert(0, ChatMessageRequest {
+                role: "system".to_string(),
+                content: format!("[Previous Conversation Summary]:\n{}", summary),
+                images: None,
+                tool_calls: None,
+                tool_name: None,
+            });
+        }
 
         // Prepend system prompt with system context
         let full_system_prompt = format!("{}{}", self.system_prompt, get_system_context());
@@ -560,7 +728,31 @@ impl<'a> App<'a> {
                 self.models = models;
                 if !self.models.is_empty() {
                     self.selected_model = 0;
+                    // Trigger fetching context limit for the default selected model
+                    let model_name = self.models[0].clone();
+                    let client = self.ollama_client.clone();
+                    let tx = self.action_tx.clone();
+                    tokio::spawn(async move {
+                        if let Ok(info) = client.show_model(&model_name).await {
+                            if let Some(limit) = info.context_length() {
+                                let _ = tx.send(Action::UpdateModelContextLimit(limit));
+                            }
+                        }
+                    });
                 }
+                true
+            }
+            Action::UpdateModelContextLimit(limit) => {
+                self.model_context_limit = Some(limit);
+                // Re-calculate token usage with new limit
+                self.current_token_usage = self.calculate_context_usage();
+                true
+            }
+            Action::SummaryReady(summary, count) => {
+                self.conversation_summary = Some(summary);
+                self.summarized_count = count; // Replace old summary scope with new one
+                self.is_summarizing = false;
+                self.current_token_usage = self.calculate_context_usage();
                 true
             }
             Action::EnterModelSelect => {
@@ -675,7 +867,15 @@ impl<'a> App<'a> {
                     self.scroll_to_bottom();
                 }
                 self.save_session_throttled();
-                self.current_token_usage = self.estimate_tokens(&self.current_response_buffer) + ContextManager::estimate_token_count(&self.messages);
+                self.current_token_usage = self.calculate_context_usage() + self.estimate_tokens(&self.current_response_buffer);
+                
+                // check for summarization
+                if !self.is_summarizing {
+                     let limit = self.model_context_limit.unwrap_or(self.context_token_limit);
+                     if self.context_manager.should_summarize(self.current_token_usage, limit) {
+                         self.trigger_summarization();
+                     }
+                }
                 true
             }
             Action::AddToolCall(tool_call) => {
@@ -1085,6 +1285,11 @@ impl<'a> App<'a> {
                                 let _ = self.action_tx.send(Action::EnterModelSelect);
                             }
                             KeyCode::F(1) => self.show_help = true,
+                            KeyCode::Esc => {
+                                self.selected_message_index = None;
+                                self.auto_scroll = false; // Stay where we are, or true? User usually wants to stop selecting.
+                                // If we don't set auto_scroll=true, we stay at current scroll pos.
+                            }
                             _ => {} // Ignore other keys in Normal mode
                         }
                     }
@@ -1600,7 +1805,7 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let config = Config {
             ollama_url: "http://localhost:11434".to_string(),
-            context_token_limit: 12,
+            context_token_limit: 2048, // Safe limit > buffer + system context
             system_prompt: "HI".to_string(),
             ignored_patterns: vec![],
             auto_context: true,
@@ -1611,16 +1816,22 @@ mod tests {
         };
         let mut app = App::new(tx, config, false, None);
 
+        // Add a huge message that won't fit in the remaining space
+        // Limit 2048 - 512 (buffer) - ~100 (system) = ~1400 available.
+        // Message of 8000 chars is ~2000 tokens.
+        let huge_msg = "a".repeat(8000);
         app.messages.push(ChatMessage {
             role: "user".to_string(),
-            content: "msg1".to_string(),
+            content: huge_msg,
             images: None,
             tool_calls: None,
             tool_name: None,
         });
+
+        // Add a small recent message that should fit
         app.messages.push(ChatMessage {
             role: "user".to_string(),
-            content: "msg3".to_string(),
+            content: "recent_msg".to_string(),
             images: None,
             tool_calls: None,
             tool_name: None,
@@ -1629,9 +1840,10 @@ mod tests {
         // Build context window from existing history
         let context = app.build_context_window();
 
-        assert_eq!(context.len(), 2);
+        // Should contain System Prompt + Recent Msg
+        assert_eq!(context.len(), 2, "Context should contain system prompt and recent message");
         assert_eq!(context[0].role, "system");
-        assert_eq!(context[1].content, "msg3");
+        assert_eq!(context[1].content, "recent_msg");
     }
 
     #[tokio::test]

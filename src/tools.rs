@@ -49,7 +49,7 @@ impl Tool for FileSearchTool {
     }
 
     fn description(&self) -> &str {
-        "USE THIS to search for files by name pattern. Examples: name='*.rs' finds Rust files, name='config*' finds config files. Searches recursively. Use path to limit search scope."
+        "USE THIS to searching for files by name pattern. This is your primary tool for finding where files are located when you don't know the exact path. Examples: name='*.rs' to find all rust files, name='config*.json' to find config files. Recursively searches the directory. Output is truncated if too large, so be specific with your pattern."
     }
 
     fn parameters(&self) -> Value {
@@ -126,7 +126,7 @@ impl Tool for ListDirectoryTool {
     }
 
     fn description(&self) -> &str {
-        "USE THIS to see what files/folders exist in a directory. Shows file sizes and dates. Use this FIRST to explore an unfamiliar directory before using other tools."
+        "USE THIS to see what files and folders exist in a directory. This is essential for exploring the file system. Shows file sizes, dates, and permissions. Use this FIRST to explore an unfamiliar directory before using other tools or if you need to check if a file exists."
     }
 
     fn parameters(&self) -> Value {
@@ -194,7 +194,7 @@ impl Tool for GrepTool {
     }
 
     fn description(&self) -> &str {
-        "USE THIS to search for text INSIDE files. Finds function definitions, variable usages, error messages, etc. Set case_insensitive=true for case-insensitive search. Example: pattern='health score', case_insensitive=true"
+        "USE THIS to search for text patterns INSIDE files. This is your primary code search tool. Use it to find function definitions, variable usages, error messages, or specific strings. Supports case-insensitivity. Example: pattern='fn main', case_insensitive=false."
     }
 
     fn parameters(&self) -> Value {
@@ -362,15 +362,17 @@ use std::fs::OpenOptions; // For append support
 // ... (imports)
 use std::sync::{Arc, Mutex};
 use crate::ollama::OllamaClient;
+use serde::{Deserialize, Serialize}; // Added imports
 
 pub struct SemanticSearchTool {
     pub client: OllamaClient,
     pub index: Arc<Mutex<Option<VectorIndex>>>,
     pub embedding_model: String,
     pub ignored_patterns: Vec<String>,
+    pub storage_path: Option<std::path::PathBuf>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct TextChunk {
     pub file_path: String,
     pub content: String,
@@ -379,9 +381,10 @@ pub struct TextChunk {
     pub embedding: Vec<f64>,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct VectorIndex {
     pub chunks: Vec<TextChunk>,
-    pub indexed_at: std::time::Instant,
+    pub indexed_at: std::time::SystemTime, // Use SystemTime for serialization compatibility
 }
 
 impl Tool for SemanticSearchTool {
@@ -421,8 +424,32 @@ impl Tool for SemanticSearchTool {
         // 1. Index is None (first run)
         // 2. Refresh requested
         let needs_indexing = {
-            let guard = self.index.lock().unwrap();
-            guard.is_none() || refresh
+            let mut guard = self.index.lock().unwrap();
+            if refresh {
+                true
+            } else if guard.is_none() {
+                // Try to load from disk first
+                if let Some(path) = &self.storage_path {
+                    if path.exists() {
+                         if let Ok(content) = std::fs::read_to_string(path) {
+                             if let Ok(loaded_index) = serde_json::from_str::<VectorIndex>(&content) {
+                                 *guard = Some(loaded_index);
+                                 false // Loaded successfully, no need to build
+                             } else {
+                                 true // Failed to parse, rebuild
+                             }
+                         } else {
+                             true // Failed to read, rebuild
+                         }
+                    } else {
+                        true // No file, build
+                    }
+                } else {
+                    true // No path, build
+                }
+            } else {
+                false // Exists in memory
+            }
         };
 
         if needs_indexing {
@@ -520,8 +547,19 @@ impl SemanticSearchTool {
         let mut guard = self.index.lock().unwrap();
         *guard = Some(VectorIndex {
             chunks,
-            indexed_at: std::time::Instant::now(),
+            indexed_at: std::time::SystemTime::now(),
         });
+        
+        // Save to disk if path is provided
+        if let Some(path) = &self.storage_path {
+             if let Ok(json) = serde_json::to_string(&*guard) {
+                 use std::fs;
+                 if let Some(parent) = path.parent() {
+                     let _ = fs::create_dir_all(parent);
+                 }
+                 let _ = fs::write(path, json);
+             }
+        }
 
         Ok(())
     }
@@ -578,7 +616,7 @@ impl Tool for WebSearchTool {
     }
 
     fn description(&self) -> &str {
-        "USE THIS to search the web for current information, documentation, or solutions. Input: query (search terms). Uses SearXNG."
+        "USE THIS to search the web for current information, news, documentation, or solutions. Input: query (search terms) and optional category. Uses SearXNG.\n- For news/current events, YOU MUST set category='news'.\n- You can use search operators in your query like 'site:npr.org' or 'filetype:pdf'."
     }
 
     fn parameters(&self) -> Value {
@@ -587,7 +625,12 @@ impl Tool for WebSearchTool {
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "The search query."
+                    "description": "The search query. Be specific."
+                },
+                "category": {
+                    "type": "string",
+                    "enum": ["general", "news", "it", "science", "files", "images", "videos", "music", "social_media"],
+                    "description": "The category of search results. Use 'news' for current events, 'it' for programming/technical, 'general' for broad searches. Defaults to 'general'."
                 }
             },
             "required": ["query"]
@@ -598,7 +641,13 @@ impl Tool for WebSearchTool {
         let query = args
             .get("query")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'query' argument"))?;
+            .ok_or_else(|| anyhow::anyhow!("Missing 'query' argument"))?
+            .trim();
+
+        let category = args
+            .get("category")
+            .and_then(|v| v.as_str())
+            .unwrap_or("general");
 
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
@@ -608,11 +657,16 @@ impl Tool for WebSearchTool {
         if !url.ends_with('/') {
             url.push('/');
         }
-        url.push_str("search"); // Assumes SearXNG API is at /search with format=json
+        url.push_str("search"); 
 
         let response = client
             .get(&url)
-            .query(&[("q", query), ("format", "json")])
+            .query(&[
+                ("q", query), 
+                ("format", "json"), 
+                ("language", "en-US"),
+                ("categories", category)
+            ])
             .send()?;
 
         if !response.status().is_success() {
@@ -621,11 +675,9 @@ impl Tool for WebSearchTool {
 
         let json: Value = response.json()?;
         
-        // Parse SearXNG JSON response
-        // Usually contains "results" array
         if let Some(results) = json.get("results").and_then(|v| v.as_array()) {
             if results.is_empty() {
-                return Ok("No results found.".to_string());
+                return Ok(format!("No results found for query: '{}'.", query));
             }
 
             let mut output = String::new();
@@ -653,7 +705,7 @@ impl Tool for CatTool {
     }
 
     fn description(&self) -> &str {
-        "USE THIS to read the full contents of a file. Use AFTER find_files or list_directory to get the actual file path. Returns the file text content."
+        "USE THIS to read the full contents of a file. Use this AFTER you have located the file using find_files or list_directory. Returns the complete file text content. If the file is extremely large, it will be truncated."
     }
 
     fn parameters(&self) -> Value {
@@ -893,7 +945,7 @@ impl Tool for RunCommandTool {
     }
 
     fn description(&self) -> &str {
-        "USE THIS to execute shell commands. Safe commands like 'ls', 'git', 'cargo' are allowed. Input: command (program) and args (list of arguments). Example: command='git', args=['status']"
+        "USE THIS to execute shell commands. Safe commands like 'ls', 'git', 'cargo'. WARNING: Do NOT use `find` directly (use find_files instead) as it may hang or fail on macOS/BSD. Input: command, args."
     }
 
     fn parameters(&self) -> Value {
@@ -937,7 +989,7 @@ impl Tool for RunCommandTool {
         // But usually `command` field is just the binary name in JSON tool use.
         // Let's assume `command_name` is the binary, and `args` contains the rest including pipes.
         
-        let mut cmd_args: Vec<String> = args
+        let cmd_args: Vec<String> = args
             .get("args")
             .and_then(|v| v.as_array())
             .map(|arr| {
@@ -970,16 +1022,19 @@ impl Tool for RunCommandTool {
                 Command::new("cmd")
                     .arg("/C")
                     .arg(&full_command)
+                    .stdin(std::process::Stdio::null())
                     .output()?
             } else {
                 Command::new("sh")
                     .arg("-c")
                     .arg(&full_command)
+                    .stdin(std::process::Stdio::null())
                     .output()?
             }
         } else {
              // Safe direct execution
             let mut cmd = Command::new(command_name);
+            cmd.stdin(std::process::Stdio::null()); // Ensure no stdin blocking
             cmd.args(&cmd_args);
             cmd.output()?
         };
