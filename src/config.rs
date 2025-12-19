@@ -22,10 +22,22 @@ pub struct Config {
     /// Threshold (0.0-1.0) at which to trigger summarization
     #[serde(default = "default_summarization_threshold")]
     pub summarization_threshold: f32,
+    #[serde(default = "default_searxng_url")]
+    pub searxng_url: String,
+    #[serde(default = "default_embedding_model")]
+    pub embedding_model: String,
 }
 
 fn default_ollama_url() -> String {
     "http://localhost:11434".to_string()
+}
+
+fn default_searxng_url() -> String {
+    "http://localhost:8080".to_string()
+}
+
+fn default_embedding_model() -> String {
+    "nomic-embed-text".to_string()
 }
 
 fn default_context_token_limit() -> usize {
@@ -115,6 +127,8 @@ impl Config {
             auto_context: default_auto_context(),
             summarization_enabled: default_summarization_enabled(),
             summarization_threshold: default_summarization_threshold(),
+            searxng_url: default_searxng_url(),
+            embedding_model: default_embedding_model(),
         })
     }
 }

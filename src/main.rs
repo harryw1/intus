@@ -40,6 +40,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             auto_context: true,
             summarization_enabled: true,
             summarization_threshold: 0.8,
+            searxng_url: "http://localhost:8080".to_string(),
+            embedding_model: "nomic-embed-text".to_string(),
         }
     });
 

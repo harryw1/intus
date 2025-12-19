@@ -7,7 +7,7 @@ edition = "2021"
 ratatui = "0.29"
 crossterm = "0.28"
 color-eyre = "0.6"
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.12", features = ["json", "stream", "blocking"] }
 tokio = { version = "1.0", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -23,6 +23,8 @@ tokio-stream = "0.1"
 toml = "0.9.10"
 directories = "6.0.0"
 sysinfo = "0.32"
+arboard = "3.6.1"
+ignore = "0.4"
 
 [dev-dependencies]
 wiremock = "0.6"

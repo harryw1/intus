@@ -424,6 +424,38 @@ impl OllamaClient {
         let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
         Ok(stream)
     }
+
+    pub async fn generate_embeddings(&self, model: &str, prompt: &str) -> Result<Vec<f64>> {
+        let request = GenerateEmbeddingRequest {
+            model: model.to_string(),
+            prompt: prompt.to_string(),
+        };
+
+        let response = self
+            .client
+            .post(&format!("{}/api/embeddings", self.base_url))
+            .json(&request)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+             return Err(anyhow::anyhow!("Embedding generation failed: {}", response.status()));
+        }
+
+        let embedding_response = response.json::<GenerateEmbeddingResponse>().await?;
+        Ok(embedding_response.embedding)
+    }
+}
+
+#[derive(Serialize)]
+struct GenerateEmbeddingRequest {
+    model: String,
+    prompt: String,
+}
+
+#[derive(Deserialize)]
+struct GenerateEmbeddingResponse {
+    embedding: Vec<f64>,
 }
 
 #[cfg(test)]

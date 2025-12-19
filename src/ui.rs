@@ -44,7 +44,17 @@ pub fn ui(f: &mut Frame, app: &mut App) {
                 .map(|s| s.as_str())
                 .unwrap_or("No Model");
 
-            let title = if let Some((status, completed, total)) = &app.pull_progress {
+            let title = if let Some((msg, time)) = &app.notification {
+                if time.elapsed().as_secs() < 3 {
+                     format!(" {} ", msg)
+                } else {
+                     app.notification = None; // Clean up old notification during render (safe enough)
+                     format!(
+                        " Ollama TUI - {} - Session: {} - Tokens: {}/{} (F1 for Help) ",
+                        model_name, app.current_session, app.current_token_usage, app.context_token_limit
+                    )
+                }
+            } else if let Some((status, completed, total)) = &app.pull_progress {
                 let percent = if let (Some(c), Some(t)) = (completed, total) {
                     if *t > 0 {
                         (*c as f64 / *t as f64 * 100.0) as u16
@@ -64,11 +74,17 @@ pub fn ui(f: &mut Frame, app: &mut App) {
                     model_name, app.current_session, app.current_token_usage, app.context_token_limit
                 )
             };
+            
+            let header_style = if app.notification.is_some() {
+                 Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+            } else {
+                 Style::default().fg(Color::Cyan)
+            };
 
             let header_block = Block::default()
                 .borders(Borders::ALL)
                 .title(title)
-                .style(Style::default().fg(Color::Cyan))
+                .style(header_style)
                 .border_type(BorderType::Rounded);
 
             if let Some((_, Some(completed), Some(total))) = &app.pull_progress {
@@ -159,6 +175,26 @@ pub fn ui(f: &mut Frame, app: &mut App) {
                 }
             }
 
+            // Ensure selected message is visible
+            if let Some(selected_idx) = app.selected_message_index {
+                 let mut current_y_offset = 0;
+                 for (i, (height, _, _)) in calculated_msgs.iter().enumerate() {
+                      if i == selected_idx {
+                          let msg_top = current_y_offset;
+                          let msg_bottom = current_y_offset + height;
+                          let viewport_h = history_area.height;
+                          
+                          if msg_top < app.vertical_scroll {
+                               app.vertical_scroll = msg_top;
+                          } else if msg_bottom > app.vertical_scroll + viewport_h {
+                               app.vertical_scroll = msg_bottom.saturating_sub(viewport_h);
+                          }
+                          break;
+                      }
+                      current_y_offset += height + 1; // +1 for margin
+                 }
+            }
+
             // Render Visible Bubbles
             let mut current_y = -(app.vertical_scroll as i32);
 
@@ -199,11 +235,17 @@ pub fn ui(f: &mut Frame, app: &mut App) {
                             (Color::Cyan, " AI ".to_string())
                         };
 
+                        let (border_style, final_title) = if Some(i) == app.selected_message_index {
+                             (Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD), format!("{} [SELECTED] ", title))
+                        } else {
+                             (Style::default().fg(border_color), title)
+                        };
+
                         let block = Block::default()
                             .borders(Borders::ALL)
                             .border_type(BorderType::Rounded)
-                            .border_style(Style::default().fg(border_color))
-                            .title(title);
+                            .border_style(border_style)
+                            .title(final_title);
 
                         if is_thinking {
                             let throbber = Throbber::default().label("Thinking...").throbber_style(
@@ -262,6 +304,18 @@ pub fn ui(f: &mut Frame, app: &mut App) {
                     }
                 }
                 current_y += bubble_height as i32 + 1;
+            }
+            
+            // "More Content" Indicator
+            // Check if we are not at the bottom
+            let max_scroll = total_height.saturating_sub(viewport_height);
+            if app.vertical_scroll < max_scroll {
+                 let indicator_area = Rect::new(history_area.x, history_area.bottom() - 1, width, 1);
+                 f.render_widget(Clear, indicator_area); // Clear any bubbles behind it
+                 let indicator = Paragraph::new("v More v")
+                    .alignment(ratatui::layout::Alignment::Center)
+                    .style(Style::default().fg(Color::DarkGray));
+                 f.render_widget(indicator, indicator_area);
             }
 
             // Render Input (TextArea)

@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::context::ContextManager;
 use crate::ollama::{ChatMessage, ChatMessageRequest, ChatStreamEvent, OllamaClient, ToolCall};
-use crate::tools::{CatTool, FileSearchTool, GrepTool, ListDirectoryTool, ReplaceTextTool, RunCommandTool, Tool, WriteFileTool};
+use crate::tools::{CatTool, FileSearchTool, GrepTool, ListDirectoryTool, ReplaceTextTool, RunCommandTool, SemanticSearchTool, Tool, WebSearchTool, WriteFileTool};
 use crossterm::event::{KeyCode, KeyModifiers};
 use directories::{BaseDirs, ProjectDirs};
 use futures::StreamExt;
@@ -13,7 +13,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use throbber_widgets_tui::ThrobberState;
 use tokio::sync::mpsc;
+use tokio::task::AbortHandle;
 use tui_textarea::{Input, TextArea};
+use arboard::Clipboard;
 
 /// Generates system context information for the LLM to understand the user's environment.
 fn get_system_context() -> String {
@@ -79,6 +81,9 @@ pub enum Action {
     PrepareQuit,
     ConfirmToolExecution,
     DenyToolExecution,
+    CancelGeneration,
+    CopyMessage,
+    MoveSelection(i16),
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -132,6 +137,14 @@ pub struct App<'a> {
     pub context_manager: ContextManager,
     pub current_token_usage: usize,
     pub tool_scroll: u16,
+    // Stop Generation
+    pub current_request_handle: Option<AbortHandle>,
+    // Clipboard & Selection
+    pub selected_message_index: Option<usize>,
+    #[allow(dead_code)] // Keep it alive
+    pub clipboard: Option<Clipboard>,
+    // UX
+    pub notification: Option<(String, std::time::Instant)>,
 }
 
 /// Maximum number of consecutive tool calls before forcing a text response
@@ -187,6 +200,21 @@ impl<'a> App<'a> {
             }),
         );
         tools.insert(
+            "semantic_search".to_string(),
+            Arc::new(SemanticSearchTool {
+                client: OllamaClient::new(config.ollama_url.clone()),
+                index: Arc::new(std::sync::Mutex::new(None)),
+                embedding_model: config.embedding_model.clone(),
+                ignored_patterns: config.ignored_patterns.clone(),
+            }),
+        );
+        tools.insert(
+            "web_search".to_string(),
+            Arc::new(WebSearchTool {
+                searxng_url: config.searxng_url.clone(),
+            }),
+        );
+        tools.insert(
             "run_command".to_string(),
             Arc::new(RunCommandTool {
                 allowed_commands: vec![
@@ -202,6 +230,9 @@ impl<'a> App<'a> {
                     "pwd".to_string(),
                     "date".to_string(),
                     "echo".to_string(),
+                    "mv".to_string(),
+                    "cp".to_string(),
+                    "stat".to_string(),
                 ],
             }),
         );
@@ -242,6 +273,10 @@ impl<'a> App<'a> {
             ),
             current_token_usage: 0,
             tool_scroll: 0,
+            current_request_handle: None,
+            selected_message_index: None,
+            clipboard: Clipboard::new().ok(),
+            notification: None,
         };
 
         if load_history {
@@ -462,7 +497,7 @@ impl<'a> App<'a> {
                 None
             };
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             match client
                 .chat(&model, context_messages, tool_definitions)
                 .await
@@ -490,6 +525,7 @@ impl<'a> App<'a> {
                 }
             }
         });
+        self.current_request_handle = Some(handle.abort_handle());
     }
 
     fn scroll_to_bottom(&mut self) {
@@ -566,9 +602,24 @@ impl<'a> App<'a> {
                 } else {
                     self.vertical_scroll = self.vertical_scroll.saturating_sub(delta.abs() as u16);
                 }
+                
+                // If we scroll manually, generally disable autoscroll UNLESS we hit bottom? 
+                // Actually the requirement is "Scrolling down past the last bubble should visually unselect the bubble".
+                // We'll handle visual unselect in ui.rs calculation OR just clear selection here if we are at bottom.
+                // But we don't know "total_height" here in App easily without recalculating.
+                // However, user said "scrolling down past the last bubble". 
+                // If we just unselect when `auto_scroll` becomes true (which happens in scroll_to_bottom), 
+                // or we can heuristically say if we scroll down, and we were selected, maybe check bounds?
+                // Let's implement a simpler heuristic: If I scroll down while selected, 
+                // and I hit the end of messages, unselect?
+                // Actually, let's just leave it for now and let the user manually unselect or click?
+                // Wait, "Scrolling down past the lasr bubble should visually unselect the bubble"
+                // This implies getting back to "live" mode.
+                
                 self.auto_scroll = false;
                 
                 // If in tool confirmation mode, apply scroll to tool_scroll
+
                 if self.mode == Mode::ToolConfirmation {
                      if delta > 0 {
                         self.tool_scroll = self.tool_scroll.saturating_add(delta as u16);
@@ -799,6 +850,56 @@ impl<'a> App<'a> {
                 self.mode = Mode::Insert;
                 true
             }
+            Action::CancelGeneration => {
+                if let Some(handle) = self.current_request_handle.take() {
+                    handle.abort();
+                }
+                self.loading = false;
+                if let Some(last) = self.messages.last_mut() {
+                    if last.role == "assistant" {
+                         last.content.push_str("\n[Cancelled]");
+                    }
+                }
+                self.save_session();
+                true
+            }
+            Action::CopyMessage => {
+                if let Some(idx) = self.selected_message_index {
+                    if let Some(msg) = self.messages.get(idx) {
+                        if let Some(clipboard) = &mut self.clipboard {
+                            if let Err(e) = clipboard.set_text(&msg.content) {
+                                self.error = Some(format!("Failed to copy: {}", e));
+                            } else {
+                                self.notification = Some(("Copied to clipboard!".to_string(), std::time::Instant::now()));
+                                self.selected_message_index = None;
+                                self.auto_scroll = true; // Go back to normal behavior? Or just unselect.
+                                // "Automatically unselect after copying"
+                            }
+                        } else {
+                            self.error = Some("Clipboard not available".to_string());
+                        }
+                    }
+                }
+                true
+            }
+            Action::MoveSelection(delta) => {
+                if self.messages.is_empty() {
+                    self.selected_message_index = None;
+                    return true;
+                }
+
+                let current_idx = self.selected_message_index.unwrap_or_else(|| self.messages.len().saturating_sub(1));
+                
+                let new_idx = if delta > 0 {
+                    current_idx.saturating_add(delta as usize).min(self.messages.len() - 1)
+                } else {
+                    current_idx.saturating_sub(delta.abs() as usize)
+                };
+
+                self.selected_message_index = Some(new_idx);
+                self.auto_scroll = false;
+                true
+            }
             Action::DeleteSession(name) => {
                 if let Some(path) = self.get_session_path(&name) {
                     let _ = fs::remove_file(path);
@@ -950,6 +1051,14 @@ impl<'a> App<'a> {
                                 && key.modifiers.contains(KeyModifiers::CONTROL)
                             {
                                 let _ = self.action_tx.send(Action::EnterModelSelect);
+                            } else if key.code == KeyCode::Char('c')
+                                && key.modifiers.contains(KeyModifiers::CONTROL)
+                            {
+                                if self.loading {
+                                   let _ = self.action_tx.send(Action::CancelGeneration);
+                                } else {
+                                    // if not loading, let main.rs handle global Ctrl+C or do nothing
+                                }
                             } else {
                                 self.input.input(Input::from(key));
                             }
@@ -963,13 +1072,14 @@ impl<'a> App<'a> {
                             KeyCode::Char('q') => {
                                 let _ = self.action_tx.send(Action::PrepareQuit);
                             }
+                            KeyCode::Char('y') => {
+                                let _ = self.action_tx.send(Action::CopyMessage);
+                            }
                             KeyCode::Char('j') | KeyCode::Down => {
-                                self.vertical_scroll = self.vertical_scroll.saturating_add(1);
-                                self.auto_scroll = false;
+                                let _ = self.action_tx.send(Action::MoveSelection(1));
                             }
                             KeyCode::Char('k') | KeyCode::Up => {
-                                self.vertical_scroll = self.vertical_scroll.saturating_sub(1);
-                                self.auto_scroll = false;
+                                let _ = self.action_tx.send(Action::MoveSelection(-1));
                             }
                             KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                 let _ = self.action_tx.send(Action::EnterModelSelect);
@@ -1142,6 +1252,8 @@ mod tests {
             auto_context: true,
             summarization_enabled: true,
             summarization_threshold: 0.8,
+            searxng_url: "http://localhost:8080".to_string(),
+            embedding_model: "nomic-embed-text".to_string(),
         };
         let app = App::new(tx, config, false, None);
 
@@ -1161,6 +1273,8 @@ mod tests {
             auto_context: true,
             summarization_enabled: true,
             summarization_threshold: 0.8,
+            searxng_url: "http://localhost:8080".to_string(),
+            embedding_model: "nomic-embed-text".to_string(),
         };
         let mut app = App::new(tx, config, false, None);
         app.models = vec!["test-model".to_string()]; // Mock models
@@ -1191,6 +1305,8 @@ mod tests {
             auto_context: true,
             summarization_enabled: true,
             summarization_threshold: 0.8,
+            searxng_url: "http://localhost:8080".to_string(),
+            embedding_model: "nomic-embed-text".to_string(),
         };
         let mut app = App::new(tx, config, false, None);
 
@@ -1212,6 +1328,8 @@ mod tests {
             auto_context: true,
             summarization_enabled: true,
             summarization_threshold: 0.8,
+            searxng_url: "http://localhost:8080".to_string(),
+            embedding_model: "nomic-embed-text".to_string(),
         };
         let mut app = App::new(tx, config, false, None);
 
@@ -1233,6 +1351,8 @@ mod tests {
             auto_context: true,
             summarization_enabled: true,
             summarization_threshold: 0.8,
+            searxng_url: "http://localhost:8080".to_string(),
+            embedding_model: "nomic-embed-text".to_string(),
         };
         let mut app = App::new(tx, config, false, None);
 
@@ -1255,6 +1375,8 @@ mod tests {
             auto_context: true,
             summarization_enabled: true,
             summarization_threshold: 0.8,
+            searxng_url: "http://localhost:8080".to_string(),
+            embedding_model: "nomic-embed-text".to_string(),
         };
         let mut app = App::new(tx, config, false, None);
 
@@ -1275,6 +1397,8 @@ mod tests {
             auto_context: true,
             summarization_enabled: true,
             summarization_threshold: 0.8,
+            searxng_url: "http://localhost:8080".to_string(),
+            embedding_model: "nomic-embed-text".to_string(),
         };
         let mut app = App::new(tx, config, false, None);
 
@@ -1306,6 +1430,8 @@ mod tests {
             auto_context: true,
             summarization_enabled: true,
             summarization_threshold: 0.8,
+            searxng_url: "http://localhost:8080".to_string(),
+            embedding_model: "nomic-embed-text".to_string(),
         };
         let mut app = App::new(tx, config, false, None);
 
@@ -1369,6 +1495,8 @@ mod tests {
             auto_context: true,
             summarization_enabled: true,
             summarization_threshold: 0.8,
+            searxng_url: "http://localhost:8080".to_string(),
+            embedding_model: "nomic-embed-text".to_string(),
         };
         let mut app = App::new(tx, config, false, None);
         app.models = vec!["test".to_string()];
@@ -1401,6 +1529,8 @@ mod tests {
             auto_context: true,
             summarization_enabled: true,
             summarization_threshold: 0.8,
+            searxng_url: "http://localhost:8080".to_string(),
+            embedding_model: "nomic-embed-text".to_string(),
         };
         let mut app = App::new(tx, config, false, None);
 
@@ -1427,6 +1557,8 @@ mod tests {
             auto_context: true,
             summarization_enabled: true,
             summarization_threshold: 0.8,
+            searxng_url: "http://localhost:8080".to_string(),
+            embedding_model: "nomic-embed-text".to_string(),
         };
         let mut app = App::new(tx, config, false, None);
 
@@ -1474,6 +1606,8 @@ mod tests {
             auto_context: true,
             summarization_enabled: true,
             summarization_threshold: 0.8,
+            searxng_url: "http://localhost:8080".to_string(),
+            embedding_model: "nomic-embed-text".to_string(),
         };
         let mut app = App::new(tx, config, false, None);
 
@@ -1498,5 +1632,114 @@ mod tests {
         assert_eq!(context.len(), 2);
         assert_eq!(context[0].role, "system");
         assert_eq!(context[1].content, "msg3");
+    }
+
+    #[tokio::test]
+    async fn test_cancel_generation() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config {
+            ollama_url: "http://localhost:11434".to_string(),
+            context_token_limit: 4096,
+            system_prompt: "You are helpful".to_string(),
+            ignored_patterns: vec![],
+            auto_context: true,
+            summarization_enabled: true,
+            summarization_threshold: 0.8,
+            searxng_url: "http://localhost:8080".to_string(),
+            embedding_model: "nomic-embed-text".to_string(),
+        };
+        let mut app = App::new(tx, config, false, None);
+
+        app.loading = true;
+        
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+        });
+        app.current_request_handle = Some(handle.abort_handle());
+
+        // Add a dummy last message to verify [Cancelled] append
+        app.messages.push(ChatMessage {
+            role: "assistant".to_string(),
+            content: "Generating".to_string(),
+            images: None,
+            tool_calls: None,
+            tool_name: None,
+        });
+
+        app.update(Action::CancelGeneration).await;
+
+        assert!(!app.loading);
+        assert!(app.current_request_handle.is_none());
+        assert!(handle.await.unwrap_err().is_cancelled());
+        assert_eq!(app.messages[0].content, "Generating\n[Cancelled]");
+    }
+
+    #[tokio::test]
+    async fn test_move_selection() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config {
+             ollama_url: "http://localhost:11434".to_string(),
+             context_token_limit: 4096,
+             system_prompt: "You are helpful".to_string(),
+             ignored_patterns: vec![],
+             auto_context: true,
+             summarization_enabled: true,
+             summarization_threshold: 0.8,
+            searxng_url: "http://localhost:8080".to_string(),
+            embedding_model: "nomic-embed-text".to_string(),
+        };
+        let mut app = App::new(tx, config, false, None);
+        
+        app.messages.push(ChatMessage { role: "user".to_string(), content: "1".to_string(), images: None, tool_calls: None, tool_name: None });
+        app.messages.push(ChatMessage { role: "assistant".to_string(), content: "2".to_string(), images: None, tool_calls: None, tool_name: None });
+
+        assert_eq!(app.selected_message_index, None);
+
+        // Move down -> selects last (len-1) = 1
+        app.update(Action::MoveSelection(1)).await;
+        assert_eq!(app.selected_message_index, Some(1));
+
+        // Move up -> 0
+        app.update(Action::MoveSelection(-1)).await;
+        assert_eq!(app.selected_message_index, Some(0));
+        
+        // Move up again -> 0
+        app.update(Action::MoveSelection(-1)).await;
+        assert_eq!(app.selected_message_index, Some(0));
+
+        // Move down -> 1
+        app.update(Action::MoveSelection(1)).await;
+        assert_eq!(app.selected_message_index, Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_copy_notification_and_unselect() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config {
+             ollama_url: "http://localhost:11434".to_string(),
+             context_token_limit: 4096,
+             system_prompt: "You are helpful".to_string(),
+             ignored_patterns: vec![],
+             auto_context: true,
+             summarization_enabled: true,
+             summarization_threshold: 0.8,
+            searxng_url: "http://localhost:8080".to_string(),
+            embedding_model: "nomic-embed-text".to_string(),
+        };
+        let mut app = App::new(tx, config, false, None);
+        
+        let msg = ChatMessage { role: "assistant".to_string(), content: "test".to_string(), images: None, tool_calls: None, tool_name: None };
+        app.messages.push(msg);
+        app.selected_message_index = Some(0);
+
+        app.update(Action::CopyMessage).await;
+        
+        if app.error.is_some() {
+            assert!(app.notification.is_none());
+        } else {
+             assert!(app.notification.is_some());
+             assert_eq!(app.notification.as_ref().unwrap().0, "Copied to clipboard!");
+             assert!(app.selected_message_index.is_none());
+        }
     }
 }

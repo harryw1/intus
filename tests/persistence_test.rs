@@ -18,6 +18,8 @@ async fn test_persistence_lifecycle() {
         auto_context: true,
         summarization_enabled: true,
         summarization_threshold: 0.8,
+        searxng_url: "http://localhost:8080".to_string(),
+        embedding_model: "nomic-embed-text".to_string(),
     };
 
     // 2. User sends message
@@ -71,6 +73,8 @@ async fn test_prepare_quit_saves_session() {
         auto_context: true,
         summarization_enabled: true,
         summarization_threshold: 0.8,
+        searxng_url: "http://localhost:8080".to_string(),
+        embedding_model: "nomic-embed-text".to_string(),
     };
 
     let mut app = App::new(tx.clone(), config.clone(), false, Some(file_path.clone()));
@@ -117,6 +121,8 @@ async fn test_atomic_write_creates_backup() {
         auto_context: true,
         summarization_enabled: true,
         summarization_threshold: 0.8,
+        searxng_url: "http://localhost:8080".to_string(),
+        embedding_model: "nomic-embed-text".to_string(),
     };
 
     // Create initial session with content

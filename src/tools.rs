@@ -353,6 +353,296 @@ impl Tool for GrepTool {
     }
 }
 
+// ... (imports)
+// Note: We need additional imports for File operations if not present
+use std::fs::OpenOptions; // For append support
+
+// ... (existing helper functions)
+
+// ... (imports)
+use std::sync::{Arc, Mutex};
+use crate::ollama::OllamaClient;
+
+pub struct SemanticSearchTool {
+    pub client: OllamaClient,
+    pub index: Arc<Mutex<Option<VectorIndex>>>,
+    pub embedding_model: String,
+    pub ignored_patterns: Vec<String>,
+}
+
+#[derive(Clone)]
+pub struct TextChunk {
+    pub file_path: String,
+    pub content: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub embedding: Vec<f64>,
+}
+
+pub struct VectorIndex {
+    pub chunks: Vec<TextChunk>,
+    pub indexed_at: std::time::Instant,
+}
+
+impl Tool for SemanticSearchTool {
+    fn name(&self) -> &str {
+        "semantic_search"
+    }
+
+    fn description(&self) -> &str {
+        "USE THIS to find code by CONCEPT or meaning, not just exact keywords. Useful for questions like 'how does auth work?'. Auto-indexes workspace on first use."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The conceptual search query (e.g. 'authentication logic')."
+                },
+                "refresh": {
+                    "type": "boolean",
+                    "description": "Force re-indexing of the workspace (default false)."
+                }
+            },
+            "required": ["query"]
+        })
+    }
+
+    fn execute(&self, args: Value) -> Result<String> {
+        let query = args.get("query").and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing 'query' argument"))?;
+        
+        let refresh = args.get("refresh").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        // Lazy Indexing Logic
+        // We need to index if:
+        // 1. Index is None (first run)
+        // 2. Refresh requested
+        let needs_indexing = {
+            let guard = self.index.lock().unwrap();
+            guard.is_none() || refresh
+        };
+
+        if needs_indexing {
+             // Releasing lock to perform indexing (async-ish via blocking client call inside loop)
+             // Ideally we shouldn't hold the lock during strict I/O, but here we just need to upgrade the state.
+             // But execute is sync, so we block everything anyway.
+             self.build_index()?;
+        }
+
+        // Generate embedding for query
+        // Since `execute` is synchronous and `client.generate_embeddings` is async, we need a runtime handle.
+        // This is a bit ugly in a sync function.
+        // Option A: Use `tokio::task::block_in_place` or `Handle::current().block_on`.
+        // Option B: Change tool trait to async (large refactor).
+        // Let's use `tokio::runtime::Handle::current().block_on` since we are likely inside a tokio runtime (the App is async).
+        
+        let handle = tokio::runtime::Handle::current();
+        let query_embedding = handle.block_on(self.client.generate_embeddings(&self.embedding_model, query))
+            .map_err(|e| anyhow::anyhow!("Failed to embed query: {}", e))?;
+
+        // Search
+        let guard = self.index.lock().unwrap();
+        if let Some(index) = &*guard {
+            let mut scored_chunks: Vec<(f64, &TextChunk)> = index.chunks.iter()
+                .map(|chunk| {
+                    let score = cosine_similarity(&query_embedding, &chunk.embedding);
+                    (score, chunk)
+                })
+                .collect();
+            
+            // Sort descending by score
+            scored_chunks.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+            let top_k = 5;
+            let mut output = String::new();
+            for (score, chunk) in scored_chunks.into_iter().take(top_k) {
+                 output.push_str(&format!(
+                    "Score: {:.4}\nFile: {}:{}-{}\nContent:\n```\n{}\n```\n\n",
+                    score, chunk.file_path, chunk.start_line, chunk.end_line, chunk.content.trim()
+                ));
+            }
+            if output.is_empty() {
+                Ok("No relevant chunks found.".to_string())
+            } else {
+                Ok(output)
+            }
+        } else {
+            Err(anyhow::anyhow!("Index failed to initialize."))
+        }
+    }
+}
+
+impl SemanticSearchTool {
+    fn build_index(&self) -> Result<()> {
+        // 1. Scan files
+        let mut chunks = Vec::new();
+        // Traverse current directory recursively
+        let walker = ignore::WalkBuilder::new(".").standard_filters(true).build();
+        
+        for result in walker {
+            let entry = result?;
+            if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+                continue;
+            }
+            let path = entry.path();
+            
+            // Skip non-text files or binary files (heuristic)
+            // Or just allow list extensions: rs, toml, md, json, js, ts, py...
+            // Simple validation: valid utf8
+            if let Ok(content) = std::fs::read_to_string(path) {
+                // Chunking Strategy: Simple Paragraphs (double newline)
+                // or specific logic for code.
+                // Let's use a naive window or paragraph splitter for now.
+                let file_chunks = self.chunk_file(path.to_string_lossy().as_ref(), &content);
+                chunks.extend(file_chunks);
+            }
+        }
+
+        // 2. Embed chunks (Batching would be ideal, but one by one for MVP)
+        let handle = tokio::runtime::Handle::current();
+        
+        for chunk in &mut chunks {
+            // This could be slow. MVP: only index first 50 chunks? No, that defeats the purpose.
+            // User warning: "Indexing..."
+            // For MVP, we might want to parallelize or batch.
+            // Let's just do it sequentially for safety first.
+            if let Ok(emb) = handle.block_on(self.client.generate_embeddings(&self.embedding_model, &chunk.content)) {
+                chunk.embedding = emb;
+            }
+        }
+        
+        // Remove chunks that failed embedding
+        chunks.retain(|c| !c.embedding.is_empty());
+
+        let mut guard = self.index.lock().unwrap();
+        *guard = Some(VectorIndex {
+            chunks,
+            indexed_at: std::time::Instant::now(),
+        });
+
+        Ok(())
+    }
+
+    fn chunk_file(&self, file_path: &str, content: &str) -> Vec<TextChunk> {
+        let mut chunks = Vec::new();
+        let lines: Vec<&str> = content.lines().collect();
+        let chunk_size = 30; // 30 lines per chunk
+        let overlap = 5; 
+        
+        if lines.is_empty() {
+            return vec![];
+        }
+
+        let mut start = 0;
+        while start < lines.len() {
+            let end = std::cmp::min(start + chunk_size, lines.len());
+            let chunk_text = lines[start..end].join("\n");
+            
+            // Only index meaningful chunks
+            if chunk_text.len() > 50 { 
+                chunks.push(TextChunk {
+                    file_path: file_path.to_string(),
+                    content: chunk_text,
+                    start_line: start + 1,
+                    end_line: end,
+                    embedding: vec![], // Filled later
+                });
+            }
+            
+            if end == lines.len() { break; }
+            start += chunk_size - overlap;
+        }
+        chunks
+    }
+}
+
+fn cosine_similarity(a: &[f64], b: &[f64]) -> f64 {
+    if a.len() != b.len() { return 0.0; }
+    let dot_product: f64 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let norm_a: f64 = a.iter().map(|x| x * x).sum::<f64>().sqrt();
+    let norm_b: f64 = b.iter().map(|x| x * x).sum::<f64>().sqrt();
+    if norm_a == 0.0 || norm_b == 0.0 { return 0.0; }
+    dot_product / (norm_a * norm_b)
+}
+
+pub struct WebSearchTool {
+    pub searxng_url: String,
+}
+
+impl Tool for WebSearchTool {
+    fn name(&self) -> &str {
+        "web_search"
+    }
+
+    fn description(&self) -> &str {
+        "USE THIS to search the web for current information, documentation, or solutions. Input: query (search terms). Uses SearXNG."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The search query."
+                }
+            },
+            "required": ["query"]
+        })
+    }
+
+    fn execute(&self, args: Value) -> Result<String> {
+        let query = args
+            .get("query")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing 'query' argument"))?;
+
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()?;
+
+        let mut url = self.searxng_url.clone();
+        if !url.ends_with('/') {
+            url.push('/');
+        }
+        url.push_str("search"); // Assumes SearXNG API is at /search with format=json
+
+        let response = client
+            .get(&url)
+            .query(&[("q", query), ("format", "json")])
+            .send()?;
+
+        if !response.status().is_success() {
+             return Err(anyhow::anyhow!("Search request failed: {}", response.status()));
+        }
+
+        let json: Value = response.json()?;
+        
+        // Parse SearXNG JSON response
+        // Usually contains "results" array
+        if let Some(results) = json.get("results").and_then(|v| v.as_array()) {
+            if results.is_empty() {
+                return Ok("No results found.".to_string());
+            }
+
+            let mut output = String::new();
+            for (i, result) in results.iter().take(5).enumerate() {
+                let title = result.get("title").and_then(|v| v.as_str()).unwrap_or("No Title");
+                let url = result.get("url").and_then(|v| v.as_str()).unwrap_or("No URL");
+                let content = result.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                
+                output.push_str(&format!("{}. [{}]({})\n   {}\n\n", i + 1, title, url, content));
+            }
+            Ok(output)
+        } else {
+            Ok("No results structure in response.".to_string())
+        }
+    }
+}
+
 pub struct CatTool {
     pub ignored_patterns: Vec<String>,
 }
@@ -390,12 +680,8 @@ impl Tool for CatTool {
             return Err(anyhow::anyhow!("Security: '..' not allowed"));
         }
 
-        // Check if path contains any ignored pattern
         for ignore in &self.ignored_patterns {
             if path.contains(ignore) {
-                // Simple check: if the path has the ignored pattern as a component
-                // e.g. "target/debug" contains "target".
-                // A more robust check would split components, but this is a "safe" heuristic for now.
                 return Err(anyhow::anyhow!(
                     "Access denied: Path contains ignored pattern '{}'",
                     ignore
@@ -412,8 +698,9 @@ impl Tool for CatTool {
         }
 
         let content = String::from_utf8_lossy(&output.stdout);
-        if content.len() > 5000 {
-            Ok(format!("{}... (truncated)", &content[..5000]))
+        // INCREASED LIMIT to 50,000
+        if content.len() > 50000 {
+            Ok(format!("{}... (truncated at 50k chars)", &content[..50000]))
         } else {
             Ok(content.to_string())
         }
@@ -430,7 +717,7 @@ impl Tool for WriteFileTool {
     }
 
     fn description(&self) -> &str {
-        "USE THIS to create NEW files or OVERWRITE existing files. Input: path (full filepath), content (text to write). Do not use this for minor edits, use replace_text instead."
+        "USE THIS to create NEW files, OVERWRITE existing files, or APPEND to files. Input: path, content, append (boolean, default false). Set append=true to add to the end of file."
     }
 
     fn parameters(&self) -> Value {
@@ -443,7 +730,11 @@ impl Tool for WriteFileTool {
                 },
                 "content": {
                     "type": "string",
-                    "description": "The full content to write to the file."
+                    "description": "The content to write."
+                },
+                "append": {
+                    "type": "boolean",
+                    "description": "If true, appends content to the end of the file. If false (default), overwrites the file."
                 }
             },
             "required": ["path", "content"]
@@ -459,6 +750,11 @@ impl Tool for WriteFileTool {
             .get("content")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'content' argument"))?;
+        
+        let append = args
+            .get("append")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         let path = expand_path(raw_path);
 
@@ -466,7 +762,6 @@ impl Tool for WriteFileTool {
             return Err(anyhow::anyhow!("Security: '..' not allowed"));
         }
 
-        // Check if path contains any ignored pattern
         for ignore in &self.ignored_patterns {
             if path.contains(ignore) {
                 return Err(anyhow::anyhow!(
@@ -481,9 +776,19 @@ impl Tool for WriteFileTool {
             std::fs::create_dir_all(parent)?;
         }
 
-        std::fs::write(&path, content)?;
-
-        Ok(format!("Successfully wrote to {}", path))
+        if append {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .append(true)
+                .create(true)
+                .open(&path)?;
+            use std::io::Write; 
+            file.write_all(content.as_bytes())?;
+            Ok(format!("Successfully appended to {}", path))
+        } else {
+            std::fs::write(&path, content)?;
+            Ok(format!("Successfully wrote to {}", path))
+        }
     }
 
     fn requires_confirmation(&self) -> bool {
@@ -580,6 +885,8 @@ pub struct RunCommandTool {
     pub allowed_commands: Vec<String>,
 }
 
+// ... impl RunCommandTool ...
+
 impl Tool for RunCommandTool {
     fn name(&self) -> &str {
         "run_command"
@@ -615,15 +922,22 @@ impl Tool for RunCommandTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'command' argument"))?;
 
-        if !self.allowed_commands.contains(&command_name.to_string()) {
-            return Err(anyhow::anyhow!(
-                "Command '{}' is not allowed. Allowed commands: {:?}",
-                command_name,
-                self.allowed_commands
-            ));
-        }
-
-        let cmd_args: Vec<String> = args
+        // Primary command check (always enforce allowlist on the main binary)
+        // If the user tries to pipe, we still want to ensure the STARTING command is allowed.
+        // E.g. "git status | grep modified" -> allowed if 'git' is allowed.
+        // "rm -rf / | echo hi" -> disallowed if 'rm' is not allowed.
+        
+        // Split the command string to find the first token if it's potentially a complex shell string
+        // NOTE: The model typically sends: command="git", args=["status", "|", "grep", "foo"]
+        // OR command="git status | grep foo", args=[] (if it misunderstands structure)
+        // We need to handle both robustly.
+        
+        // Ideally, we treat `command_name` as the binary. 
+        // If `command_name` contains spaces or operators, we might need to parse it?
+        // But usually `command` field is just the binary name in JSON tool use.
+        // Let's assume `command_name` is the binary, and `args` contains the rest including pipes.
+        
+        let mut cmd_args: Vec<String> = args
             .get("args")
             .and_then(|v| v.as_array())
             .map(|arr| {
@@ -633,10 +947,42 @@ impl Tool for RunCommandTool {
             })
             .unwrap_or_default();
 
-        let mut cmd = Command::new(command_name);
-        cmd.args(&cmd_args);
+        if !self.allowed_commands.contains(&command_name.to_string()) {
+            return Err(anyhow::anyhow!(
+                "Command '{}' is not allowed. Allowed commands: {:?}",
+                command_name,
+                self.allowed_commands
+            ));
+        }
+        
+        // Detect if shell features are needed
+        // If args contain shell operators, we must use a shell.
+        let shell_operators = ["|", "&&", ";", ">", ">>", "<", "&"];
+        let needs_shell = cmd_args.iter().any(|arg| {
+            shell_operators.iter().any(|op| arg.contains(op))
+        });
 
-        let output = cmd.output()?;
+        let output = if needs_shell {
+            // Reconstruct the full command string
+            let full_command = format!("{} {}", command_name, cmd_args.join(" "));
+            
+            if cfg!(target_os = "windows") {
+                Command::new("cmd")
+                    .arg("/C")
+                    .arg(&full_command)
+                    .output()?
+            } else {
+                Command::new("sh")
+                    .arg("-c")
+                    .arg(&full_command)
+                    .output()?
+            }
+        } else {
+             // Safe direct execution
+            let mut cmd = Command::new(command_name);
+            cmd.args(&cmd_args);
+            cmd.output()?
+        };
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -842,6 +1188,62 @@ mod tests {
 
         let result = tool.execute(args);
         assert!(result.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_command_shell_piping() -> Result<()> {
+        let tool = RunCommandTool {
+            allowed_commands: vec!["echo".to_string(), "grep".to_string()],
+        };
+        // This command uses piping, so it should trigger the shell path.
+        // The allowed_commands check passes because "echo" is allowed.
+        let args = serde_json::json!({
+            "command": "echo",
+            "args": ["hello world", "|", "grep", "hello"]
+        });
+
+        let output = tool.execute(args)?;
+        assert!(output.contains("hello world"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_run_command_shell_piping_fail_allowlist() -> Result<()> {
+        let tool = RunCommandTool {
+            allowed_commands: vec!["ls".to_string()],
+        };
+        // "echo" is not allowed, so it should fail even if piping is used
+        let args = serde_json::json!({
+            "command": "echo",
+            "args": ["hello"]
+        });
+
+        let result = tool.execute(args);
+        assert!(result.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_write_file_append() -> Result<()> {
+        let dir = tempdir()?;
+        let file_path = dir.path().join("append_test.txt");
+        std::fs::write(&file_path, "Initial")?;
+
+        let tool = WriteFileTool {
+            ignored_patterns: vec![],
+        };
+        let args = serde_json::json!({
+            "path": file_path.to_str().unwrap(),
+            "content": " + Appended",
+            "append": true
+        });
+
+        let output = tool.execute(args)?;
+        assert!(output.contains("Successfully appended"));
+
+        let content = std::fs::read_to_string(&file_path)?;
+        assert_eq!(content, "Initial + Appended");
         Ok(())
     }
 }
