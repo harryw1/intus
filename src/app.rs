@@ -1,6 +1,7 @@
 use crate::config::Config;
+use crate::context::ContextManager;
 use crate::ollama::{ChatMessage, ChatMessageRequest, ChatStreamEvent, OllamaClient, ToolCall};
-use crate::tools::{CatTool, FileSearchTool, GrepTool, ListDirectoryTool, Tool};
+use crate::tools::{CatTool, FileSearchTool, GrepTool, ListDirectoryTool, ReplaceTextTool, RunCommandTool, Tool, WriteFileTool};
 use crossterm::event::{KeyCode, KeyModifiers};
 use directories::{BaseDirs, ProjectDirs};
 use futures::StreamExt;
@@ -76,6 +77,8 @@ pub enum Action {
     PullProgress(String, Option<u64>, Option<u64>), // Status, Completed, Total
     DeleteModel(String),
     PrepareQuit,
+    ConfirmToolExecution,
+    DenyToolExecution,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -87,6 +90,7 @@ pub enum Mode {
     SessionSelect,
     SessionCreate,
     ModelPullInput,
+    ToolConfirmation,
 }
 
 pub struct App<'a> {
@@ -118,9 +122,20 @@ pub struct App<'a> {
     pub pull_progress: Option<(String, Option<u64>, Option<u64>)>,
     // Tools
     pub tools: HashMap<String, Arc<dyn Tool>>,
+    /// Counter for consecutive tool calls to prevent infinite loops
+    consecutive_tool_calls: usize,
+    /// Pending tool call waiting for user confirmation
+    pub pending_tool_call: Option<ToolCall>,
     // Persistence
     last_save_time: std::time::Instant,
+    // Context Management
+    pub context_manager: ContextManager,
+    pub current_token_usage: usize,
+    pub tool_scroll: u16,
 }
+
+/// Maximum number of consecutive tool calls before forcing a text response
+const MAX_CONSECUTIVE_TOOL_CALLS: usize = 3;
 
 impl<'a> App<'a> {
     pub fn new(
@@ -159,6 +174,37 @@ impl<'a> App<'a> {
                 ignored_patterns: config.ignored_patterns.clone(),
             }),
         );
+        tools.insert(
+            "write_file".to_string(),
+            Arc::new(WriteFileTool {
+                ignored_patterns: config.ignored_patterns.clone(),
+            }),
+        );
+        tools.insert(
+            "replace_text".to_string(),
+            Arc::new(ReplaceTextTool {
+                ignored_patterns: config.ignored_patterns.clone(),
+            }),
+        );
+        tools.insert(
+            "run_command".to_string(),
+            Arc::new(RunCommandTool {
+                allowed_commands: vec![
+                    "git".to_string(),
+                    "ls".to_string(),
+                    "grep".to_string(),
+                    "rg".to_string(),
+                    "find".to_string(),
+                    "cargo".to_string(),
+                    "mkdir".to_string(),
+                    "rmdir".to_string(),
+                    "touch".to_string(),
+                    "pwd".to_string(),
+                    "date".to_string(),
+                    "echo".to_string(),
+                ],
+            }),
+        );
 
         let mut app = Self {
             ollama_client: OllamaClient::new(config.ollama_url),
@@ -186,7 +232,16 @@ impl<'a> App<'a> {
             pull_input: TextArea::default(),
             pull_progress: None,
             tools,
+            consecutive_tool_calls: 0,
+            pending_tool_call: None,
             last_save_time: std::time::Instant::now(),
+            context_manager: ContextManager::new(
+                config.auto_context,
+                config.summarization_enabled,
+                config.summarization_threshold,
+            ),
+            current_token_usage: 0,
+            tool_scroll: 0,
         };
 
         if load_history {
@@ -219,6 +274,7 @@ impl<'a> App<'a> {
                 content: msg.content.clone(),
                 images: msg.images.clone(),
                 tool_calls: msg.tool_calls.clone(),
+                tool_name: msg.tool_name.clone(),
             });
             current_tokens += msg_tokens;
         }
@@ -235,6 +291,7 @@ impl<'a> App<'a> {
                 content: full_system_prompt,
                 images: None,
                 tool_calls: None,
+                tool_name: None,
             },
         );
 
@@ -356,6 +413,7 @@ impl<'a> App<'a> {
                 }
             }
         }
+        self.current_token_usage = ContextManager::estimate_token_count(&self.messages);
     }
 
     async fn request_ai_response(&mut self) {
@@ -373,6 +431,7 @@ impl<'a> App<'a> {
                     content: String::new(),
                     images: None,
                     tool_calls: None,
+                    tool_name: None,
                 });
                 self.current_response_buffer.clear();
             } else {
@@ -384,6 +443,7 @@ impl<'a> App<'a> {
                 content: String::new(),
                 images: None,
                 tool_calls: None,
+                tool_name: None,
             });
             self.current_response_buffer.clear();
         }
@@ -393,11 +453,14 @@ impl<'a> App<'a> {
         let client = self.ollama_client.clone();
         let tx = self.action_tx.clone();
 
-        let tool_definitions = if !self.tools.is_empty() {
-            Some(self.tools.values().map(|t| t.definition()).collect())
-        } else {
-            None
-        };
+        // Disable tools if we've hit the consecutive tool call limit
+        // This forces the model to generate a text response
+        let tool_definitions =
+            if !self.tools.is_empty() && self.consecutive_tool_calls < MAX_CONSECUTIVE_TOOL_CALLS {
+                Some(self.tools.values().map(|t| t.definition()).collect())
+            } else {
+                None
+            };
 
         tokio::spawn(async move {
             match client
@@ -504,6 +567,15 @@ impl<'a> App<'a> {
                     self.vertical_scroll = self.vertical_scroll.saturating_sub(delta.abs() as u16);
                 }
                 self.auto_scroll = false;
+                
+                // If in tool confirmation mode, apply scroll to tool_scroll
+                if self.mode == Mode::ToolConfirmation {
+                     if delta > 0 {
+                        self.tool_scroll = self.tool_scroll.saturating_add(delta as u16);
+                    } else {
+                        self.tool_scroll = self.tool_scroll.saturating_sub(delta.abs() as u16);
+                    }
+                }
                 true
             }
             Action::SendMessage => {
@@ -520,16 +592,20 @@ impl<'a> App<'a> {
                 true
             }
             Action::AddUserMessage(msg) => {
+                // Reset tool call counter on new user message
+                self.consecutive_tool_calls = 0;
                 self.messages.push(ChatMessage {
                     role: "user".to_string(),
                     content: msg,
                     images: None,
                     tool_calls: None,
+                    tool_name: None,
                 });
                 self.loading = true;
                 self.scroll_to_bottom();
                 self.save_session();
                 let _ = self.action_tx.send(Action::RequestAiResponse);
+                self.current_token_usage = ContextManager::estimate_token_count(&self.messages);
                 true
             }
             Action::RequestAiResponse => {
@@ -548,9 +624,12 @@ impl<'a> App<'a> {
                     self.scroll_to_bottom();
                 }
                 self.save_session_throttled();
+                self.current_token_usage = self.estimate_tokens(&self.current_response_buffer) + ContextManager::estimate_token_count(&self.messages);
                 true
             }
             Action::AddToolCall(tool_call) => {
+                // Increment consecutive tool call counter
+                self.consecutive_tool_calls += 1;
                 if let Some(last) = self.messages.last_mut() {
                     if last.role == "assistant" {
                         if last.tool_calls.is_none() {
@@ -561,21 +640,46 @@ impl<'a> App<'a> {
                         }
                         // Visual feedback
                         last.content
-                            .push_str(&format!("\n[Tool Call: {}]", tool_call.function.name));
+                            .push_str(&format!("\n> **Tool Call:** `{}`", tool_call.function.name));
+
+                        // Recalculate token usage
+                        self.current_token_usage = ContextManager::estimate_token_count(&self.messages);
 
                         // EXECUTE TOOL
                         let tool_name = tool_call.function.name.clone();
                         let tool_args = tool_call.function.arguments.clone();
 
                         if let Some(tool) = self.tools.get(&tool_name) {
+                            // Check if confirmation is needed
+                            if tool.requires_confirmation() {
+                                self.pending_tool_call = Some(tool_call.clone());
+                                self.mode = Mode::ToolConfirmation;
+                                self.tool_scroll = 0; // Reset scroll
+                                self.loading = false; // Stop loading spinner while waiting for user
+                                return true;
+                            }
+
                             let tx = self.action_tx.clone();
                             let tool_arc = tool.clone();
 
                             tokio::spawn(async move {
-                                let result = tool_arc.execute(tool_args);
+                                // Use spawn_blocking for the synchronous tool execution
+                                // with a 30-second timeout to prevent hanging
+                                let tool_clone = tool_arc.clone();
+                                let args_clone = tool_args.clone();
+                                
+                                let result = tokio::time::timeout(
+                                    std::time::Duration::from_secs(120),
+                                    tokio::task::spawn_blocking(move || {
+                                        tool_clone.execute(args_clone)
+                                    })
+                                ).await;
+                                
                                 let output = match result {
-                                    Ok(s) => s,
-                                    Err(e) => format!("Error: {}", e),
+                                    Ok(Ok(Ok(s))) => s,
+                                    Ok(Ok(Err(e))) => format!("Tool error: {}", e),
+                                    Ok(Err(e)) => format!("Tool execution failed: {}", e),
+                                    Err(_) => "Tool timed out after 120 seconds. Try a more specific search path (e.g., ~/Documents instead of ~).".to_string(),
                                 };
                                 let _ = tx.send(Action::AddToolOutput(tool_name, output));
                             });
@@ -590,12 +694,58 @@ impl<'a> App<'a> {
                 self.save_session();
                 true
             }
-            Action::AddToolOutput(_name, output) => {
+
+            Action::ConfirmToolExecution => {
+                if let Some(tool_call) = self.pending_tool_call.take() {
+                    let tool_name = tool_call.function.name.clone();
+                    let tool_args = tool_call.function.arguments.clone();
+                    
+                    self.loading = true; // Resume loading
+                    self.mode = Mode::Insert;
+
+                    if let Some(tool) = self.tools.get(&tool_name) {
+                        let tx = self.action_tx.clone();
+                        let tool_arc = tool.clone();
+                         tokio::spawn(async move {
+                            let tool_clone = tool_arc.clone();
+                            let args_clone = tool_args.clone();
+                            
+                            let result = tokio::time::timeout(
+                                std::time::Duration::from_secs(120),
+                                tokio::task::spawn_blocking(move || {
+                                    tool_clone.execute(args_clone)
+                                })
+                            ).await;
+                            
+                            let output = match result {
+                                Ok(Ok(Ok(s))) => s,
+                                Ok(Ok(Err(e))) => format!("Tool error: {}", e),
+                                Ok(Err(e)) => format!("Tool execution failed: {}", e),
+                                Err(_) => "Tool timed out.".to_string(),
+                            };
+                            let _ = tx.send(Action::AddToolOutput(tool_name, output));
+                        });
+                    }
+                }
+                true
+            }
+            Action::DenyToolExecution => {
+                if let Some(tool_call) = self.pending_tool_call.take() {
+                     let _ = self.action_tx.send(Action::AddToolOutput(
+                        tool_call.function.name,
+                        "Tool execution denied by user.".to_string(),
+                    ));
+                    self.mode = Mode::Insert;
+                }
+                true
+            }
+            Action::AddToolOutput(name, output) => {
                 self.messages.push(ChatMessage {
                     role: "tool".to_string(),
                     content: output,
                     images: None,
                     tool_calls: None,
+                    tool_name: Some(name),
                 });
                 let _ = self.action_tx.send(Action::RequestAiResponse);
                 self.save_session();
@@ -948,6 +1098,21 @@ impl<'a> App<'a> {
                             self.pull_input.input(Input::from(key));
                         }
                     },
+                    Mode::ToolConfirmation => match key.code {
+                        KeyCode::Char('y') | KeyCode::Char('Y') => {
+                            let _ = self.action_tx.send(Action::ConfirmToolExecution);
+                        }
+                        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                            let _ = self.action_tx.send(Action::DenyToolExecution);
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            let _ = self.action_tx.send(Action::Scroll(-1));
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            let _ = self.action_tx.send(Action::Scroll(1));
+                        }
+                        _ => {}
+                    },
                 }
                 true
             }
@@ -974,6 +1139,9 @@ mod tests {
             context_token_limit: 4096,
             system_prompt: "You are helpful".to_string(),
             ignored_patterns: vec![],
+            auto_context: true,
+            summarization_enabled: true,
+            summarization_threshold: 0.8,
         };
         let app = App::new(tx, config, false, None);
 
@@ -990,6 +1158,9 @@ mod tests {
             context_token_limit: 4096,
             system_prompt: "You are helpful".to_string(),
             ignored_patterns: vec![],
+            auto_context: true,
+            summarization_enabled: true,
+            summarization_threshold: 0.8,
         };
         let mut app = App::new(tx, config, false, None);
         app.models = vec!["test-model".to_string()]; // Mock models
@@ -1017,6 +1188,9 @@ mod tests {
             context_token_limit: 4096,
             system_prompt: "You are helpful".to_string(),
             ignored_patterns: vec![],
+            auto_context: true,
+            summarization_enabled: true,
+            summarization_threshold: 0.8,
         };
         let mut app = App::new(tx, config, false, None);
 
@@ -1035,6 +1209,9 @@ mod tests {
             context_token_limit: 4096,
             system_prompt: "You are helpful".to_string(),
             ignored_patterns: vec![],
+            auto_context: true,
+            summarization_enabled: true,
+            summarization_threshold: 0.8,
         };
         let mut app = App::new(tx, config, false, None);
 
@@ -1053,6 +1230,9 @@ mod tests {
             context_token_limit: 4096,
             system_prompt: "You are helpful".to_string(),
             ignored_patterns: vec![],
+            auto_context: true,
+            summarization_enabled: true,
+            summarization_threshold: 0.8,
         };
         let mut app = App::new(tx, config, false, None);
 
@@ -1072,6 +1252,9 @@ mod tests {
             context_token_limit: 4096,
             system_prompt: "You are helpful".to_string(),
             ignored_patterns: vec![],
+            auto_context: true,
+            summarization_enabled: true,
+            summarization_threshold: 0.8,
         };
         let mut app = App::new(tx, config, false, None);
 
@@ -1089,6 +1272,9 @@ mod tests {
             context_token_limit: 4096,
             system_prompt: "You are helpful".to_string(),
             ignored_patterns: vec![],
+            auto_context: true,
+            summarization_enabled: true,
+            summarization_threshold: 0.8,
         };
         let mut app = App::new(tx, config, false, None);
 
@@ -1117,6 +1303,9 @@ mod tests {
             context_token_limit: 4096,
             system_prompt: "You are helpful".to_string(),
             ignored_patterns: vec![],
+            auto_context: true,
+            summarization_enabled: true,
+            summarization_threshold: 0.8,
         };
         let mut app = App::new(tx, config, false, None);
 
@@ -1177,6 +1366,9 @@ mod tests {
             context_token_limit: 4096,
             system_prompt: "You are helpful".to_string(),
             ignored_patterns: vec![],
+            auto_context: true,
+            summarization_enabled: true,
+            summarization_threshold: 0.8,
         };
         let mut app = App::new(tx, config, false, None);
         app.models = vec!["test".to_string()];
@@ -1206,6 +1398,9 @@ mod tests {
             context_token_limit: 4096,
             system_prompt: "You are helpful".to_string(),
             ignored_patterns: vec![],
+            auto_context: true,
+            summarization_enabled: true,
+            summarization_threshold: 0.8,
         };
         let mut app = App::new(tx, config, false, None);
 
@@ -1229,6 +1424,9 @@ mod tests {
             context_token_limit: 4096,
             system_prompt: "You are helpful".to_string(),
             ignored_patterns: vec![],
+            auto_context: true,
+            summarization_enabled: true,
+            summarization_threshold: 0.8,
         };
         let mut app = App::new(tx, config, false, None);
 
@@ -1238,6 +1436,7 @@ mod tests {
             content: "Searching...".to_string(),
             images: None,
             tool_calls: None,
+            tool_name: None,
         });
 
         let tool_call = ToolCall {
@@ -1252,7 +1451,7 @@ mod tests {
         let last_msg = app.messages.last().unwrap();
         assert_eq!(last_msg.role, "assistant");
         // Verify visual feedback
-        assert!(last_msg.content.contains("[Tool Call: find_files]"));
+        assert!(last_msg.content.contains("> **Tool Call:** `find_files`"));
         // Verify structural storage
         assert!(last_msg.tool_calls.is_some());
         assert_eq!(last_msg.tool_calls.as_ref().unwrap().len(), 1);
@@ -1272,6 +1471,9 @@ mod tests {
             context_token_limit: 12,
             system_prompt: "HI".to_string(),
             ignored_patterns: vec![],
+            auto_context: true,
+            summarization_enabled: true,
+            summarization_threshold: 0.8,
         };
         let mut app = App::new(tx, config, false, None);
 
@@ -1280,12 +1482,14 @@ mod tests {
             content: "msg1".to_string(),
             images: None,
             tool_calls: None,
+            tool_name: None,
         });
         app.messages.push(ChatMessage {
             role: "user".to_string(),
             content: "msg3".to_string(),
             images: None,
             tool_calls: None,
+            tool_name: None,
         });
 
         // Build context window from existing history

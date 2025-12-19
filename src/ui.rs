@@ -60,8 +60,8 @@ pub fn ui(f: &mut Frame, app: &mut App) {
                 )
             } else {
                 format!(
-                    " Ollama TUI - {} - Session: {} (F1 for Help) ",
-                    model_name, app.current_session
+                    " Ollama TUI - {} - Session: {} - Tokens: {}/{} (F1 for Help) ",
+                    model_name, app.current_session, app.current_token_usage, app.context_token_limit
                 )
             };
 
@@ -90,10 +90,10 @@ pub fn ui(f: &mut Frame, app: &mut App) {
             // History (Bubbles)
             let history_area = chunks[1];
             let width = history_area.width;
-            let bubble_max_width = (width as f32 * 0.70) as u16;
+            let bubble_max_width = (width as f32 * 0.90) as u16;
 
             if app.messages.is_empty() {
-                let empty_text = format!("Start a conversation by typing a message below.\n(Ctrl+o: Model, Ctrl+r: Sessions, Ctrl+s: System Prompt)\n\nCurrent System Prompt: \"{}\"", app.system_prompt);
+                let empty_text = format!("Start a conversation by typing a message below.\n(Ctrl+o: Model, Ctrl+r: Sessions, Ctrl+s: System Prompt)");
                 let p = Paragraph::new(empty_text)
                     .alignment(ratatui::layout::Alignment::Center)
                     .style(Style::default().fg(Color::DarkGray));
@@ -122,7 +122,15 @@ pub fn ui(f: &mut Frame, app: &mut App) {
                     calculated_msgs.push((height, None, true));
                     total_height += height;
                 } else {
-                    let md = tui_markdown::from_str(&msg.content);
+                    let content_to_render = if msg.tool_name.is_some() {
+                         insert_soft_hyphens(&msg.content)
+                    } else {
+                        msg.content.clone()
+                    };
+
+                    let md_borrowed = tui_markdown::from_str(&content_to_render);
+                    let md = to_owned_text(md_borrowed);
+                    
                     let content_width = bubble_max_width.saturating_sub(2);
                     let height = estimate_wrapped_height(&md, content_width) + 2;
 
@@ -184,9 +192,11 @@ pub fn ui(f: &mut Frame, app: &mut App) {
                             Rect::new(history_area.x + x, visible_y, bubble_width, visible_height);
 
                         let (border_color, title) = if is_user {
-                            (Color::Green, " You ")
+                            (Color::Green, " You ".to_string())
+                        } else if app.messages[i].tool_name.is_some() {
+                             (Color::Magenta, format!(" Tool Output: {} ", app.messages[i].tool_name.as_deref().unwrap_or("Unknown")))
                         } else {
-                            (Color::Cyan, " AI ")
+                            (Color::Cyan, " AI ".to_string())
                         };
 
                         let block = Block::default()
@@ -211,12 +221,39 @@ pub fn ui(f: &mut Frame, app: &mut App) {
                             };
                             f.render_stateful_widget(throbber, inner_area, &mut app.spinner_state);
                         } else if let Some(text) = text_opt {
+                             // If it's a tool output, we might want to soft-wrap
+                            let display_text = if app.messages[i].tool_name.is_some() {
+                                // Extract raw text if possible, or just use what we have. 
+                                // Actually, `text_opt` is `Text`, we might need to process the raw content again 
+                                // or just hack it here. 
+                                // Better: modifying `calculated_msgs` loop might be cleaner, but let's see.
+                                // The `text` here is already parsed markdown. 
+                                // For tool output (which is usually code block or raw text), tui-markdown might have wrapped it in code blocks.
+                                
+                                // Actually, let's look at where `text` usually comes from.
+                                // It comes from `tui_markdown::from_str(&msg.content)`.
+                                // If we want soft wrapping, we should probably do it BEFORE markdown parsing 
+                                // OR manually construct the Paragraph for tools without markdown parsing if we want raw control?
+                                // BUT we want markdown for "Tool Call" blockquotes.
+                                
+                                // Wait, `app.messages[i]` content for Tool Output is just the raw output string usually.
+                                // We are rendering it as markdown.
+                                // If we insert soft hyphens into the raw string, they might mess up markdown parsing if not careful?
+                                // Zero-width space `\u{200B}` is usually fine.
+                                
+                                // Let's try applying it to the content BEFORE markdown parsing in the calculation loop?
+                                // That seems safer and more consistent.
+                                text.clone() // Placeholder, we'll change the CALCULATION loop instead.
+                            } else {
+                                text.clone() 
+                            };
+
                             let scroll_offset = if item_top < area_top as i32 {
                                 (area_top as i32 - item_top) as u16
                             } else {
                                 0
                             };
-                            let p = Paragraph::new(text)
+                            let p = Paragraph::new(display_text)
                                 .block(block)
                                 .wrap(Wrap { trim: false })
                                 .scroll((scroll_offset, 0));
@@ -245,6 +282,7 @@ pub fn ui(f: &mut Frame, app: &mut App) {
                     Mode::SessionSelect => (Color::Magenta, " Session Manager ".to_string()),
                     Mode::SessionCreate => (Color::Magenta, " Create Session ".to_string()),
                     Mode::ModelPullInput => (Color::Magenta, " Enter Model Name ".to_string()),
+                    Mode::ToolConfirmation => (Color::Red, " Confirm Tool Execution ".to_string()),
                 }
             };
 
@@ -369,6 +407,28 @@ pub fn ui(f: &mut Frame, app: &mut App) {
             );
             f.render_widget(&app.pull_input, area);
         }
+        Mode::ToolConfirmation => {
+            let area = centered_rect(60, 40, size);
+            f.render_widget(Clear, area);
+
+            if let Some(tool_call) = &app.pending_tool_call {
+                let tool_name = &tool_call.function.name;
+                let args_str = serde_json::to_string_pretty(&tool_call.function.arguments)
+                    .unwrap_or_else(|_| "Invalid JSON".to_string());
+
+                let text = format!("Tool: {}\n\nArguments:\n{}\n\nAllow execution? (y/n)", tool_name, args_str);
+                
+                let p = Paragraph::new(text)
+                    .block(Block::default()
+                        .title(" Confirm Tool Execution (Scroll with Up/Down or j/k) ")
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(Color::Red)))
+                    .wrap(Wrap { trim: false })
+                    .scroll((app.tool_scroll, 0));
+                f.render_widget(p, area);
+            }
+        }
     }
 }
 
@@ -403,10 +463,38 @@ fn estimate_wrapped_height(text: &Text, width: u16) -> u16 {
             height += 1;
         } else {
             height += (line_width as f32 / width as f32).ceil() as u16;
-            if height == 0 && line_width > 0 {
-                height = 1;
-            }
         }
     }
     height
+}
+
+fn to_owned_text(text: Text) -> Text<'static> {
+    let lines: Vec<_> = text.lines.into_iter().map(|line| {
+        let spans: Vec<_> = line.spans.into_iter().map(|span| {
+            Span::styled(span.content.into_owned(), span.style)
+        }).collect();
+        ratatui::text::Line::from(spans)
+    }).collect();
+    Text::from(lines)
+}
+
+/// Inserts zero-width spaces after common separators to allow for soft wrapping
+fn insert_soft_hyphens(text: &str) -> String {
+    // \u{200B} is ZERO WIDTH SPACE
+    text.replace('/', "/\u{200B}")
+        .replace('_', "_\u{200B}")
+        .replace(',', ",\u{200B}")
+        // We can add more if needed, essentially "allow break after these chars"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_insert_soft_hyphens() {
+        let input = "path/to/very/long/file_name.txt";
+        let output = insert_soft_hyphens(input);
+        assert_eq!(output, "path/\u{200B}to/\u{200B}very/\u{200B}long/\u{200B}file_\u{200B}name.txt");
+    }
 }

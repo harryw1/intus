@@ -21,6 +21,9 @@ pub struct ChatMessage {
     pub images: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
+    /// Name of the tool when role is "tool" (for tool response messages)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -41,6 +44,9 @@ pub struct ChatMessageRequest {
     pub images: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
+    /// Name of the tool when role is "tool" (for tool response messages)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -86,6 +92,73 @@ pub struct PullModelResponse {
     pub digest: Option<String>,
     pub total: Option<u64>,
     pub completed: Option<u64>,
+}
+
+// Model Information Structures (from /api/show)
+#[derive(Deserialize, Debug, Clone)]
+pub struct ModelInfo {
+    #[serde(default)]
+    pub modelfile: String,
+    #[serde(default)]
+    pub parameters: String,
+    #[serde(default)]
+    pub template: String,
+    pub details: Option<ModelDetails>,
+    #[serde(default)]
+    pub model_info: HashMap<String, Value>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct ModelDetails {
+    pub format: Option<String>,
+    pub family: Option<String>,
+    pub parameter_size: Option<String>,
+    pub quantization_level: Option<String>,
+}
+
+impl ModelInfo {
+    /// Get the context length from model_info if available
+    pub fn context_length(&self) -> Option<usize> {
+        // Try common keys: "llama.context_length", "context_length", etc.
+        if let Some(val) = self.model_info.get("llama.context_length") {
+            return val.as_u64().map(|v| v as usize);
+        }
+        if let Some(val) = self.model_info.get("context_length") {
+            return val.as_u64().map(|v| v as usize);
+        }
+        // Check in parameters string for "num_ctx"
+        for line in self.parameters.lines() {
+            if line.contains("num_ctx") {
+                if let Some(val) = line.split_whitespace().last() {
+                    if let Ok(n) = val.parse::<usize>() {
+                        return Some(n);
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+#[derive(Serialize)]
+struct ShowModelRequest {
+    name: String,
+}
+
+// Running Models Structures (from /api/ps)
+#[derive(Deserialize, Debug, Clone)]
+pub struct RunningModelsResponse {
+    pub models: Vec<RunningModel>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct RunningModel {
+    pub name: String,
+    pub model: String,
+    pub size: u64,
+    #[serde(default)]
+    pub size_vram: u64,
+    pub details: Option<ModelDetails>,
 }
 
 // Tooling Structures
@@ -158,6 +231,45 @@ impl OllamaClient {
             return Err(anyhow::anyhow!("Delete failed: {}", response.status()));
         }
         Ok(())
+    }
+
+    /// Get detailed information about a model, including its context length
+    pub async fn show_model(&self, name: &str) -> Result<ModelInfo> {
+        let request = ShowModelRequest {
+            name: name.to_string(),
+        };
+        let response = self
+            .client
+            .post(&format!("{}/api/show", self.base_url))
+            .json(&request)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(anyhow::anyhow!("Show model failed: {}", response.status()));
+        }
+
+        let model_info = response.json::<ModelInfo>().await?;
+        Ok(model_info)
+    }
+
+    /// List currently running models with their VRAM usage
+    pub async fn list_running(&self) -> Result<Vec<RunningModel>> {
+        let response = self
+            .client
+            .get(&format!("{}/api/ps", self.base_url))
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(anyhow::anyhow!(
+                "List running failed: {}",
+                response.status()
+            ));
+        }
+
+        let running = response.json::<RunningModelsResponse>().await?;
+        Ok(running.models)
     }
 
     pub async fn pull_model(
@@ -393,6 +505,7 @@ mod tests {
             content: "Hi".to_string(),
             images: None,
             tool_calls: None,
+            tool_name: None,
         }];
         let mut stream = client
             .chat("llama2", messages, None)
@@ -426,9 +539,89 @@ mod tests {
             content: "Hi".to_string(),
             images: None,
             tool_calls: None,
+            tool_name: None,
         }];
         let result = client.chat("llama2", messages, None).await;
 
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_show_model_returns_context_length() {
+        let mock_server = MockServer::start().await;
+        let client = OllamaClient::new(mock_server.uri());
+
+        let mock_response = json!({
+            "modelfile": "FROM llama2",
+            "parameters": "num_ctx 8192",
+            "template": "{{ .Prompt }}",
+            "details": {
+                "format": "gguf",
+                "family": "llama",
+                "parameter_size": "7B",
+                "quantization_level": "Q4_0"
+            },
+            "model_info": {
+                "llama.context_length": 8192,
+                "general.architecture": "llama"
+            }
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/api/show"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(mock_response))
+            .mount(&mock_server)
+            .await;
+
+        let model_info = client
+            .show_model("llama2")
+            .await
+            .expect("Failed to get model info");
+
+        // Test context_length extraction
+        assert_eq!(model_info.context_length(), Some(8192));
+        assert!(model_info.details.is_some());
+        assert_eq!(
+            model_info.details.as_ref().unwrap().family,
+            Some("llama".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_running_models() {
+        let mock_server = MockServer::start().await;
+        let client = OllamaClient::new(mock_server.uri());
+
+        let mock_response = json!({
+            "models": [
+                {
+                    "name": "llama2:latest",
+                    "model": "llama2:latest",
+                    "size": 5137025024_u64,
+                    "size_vram": 4000000000_u64,
+                    "details": {
+                        "format": "gguf",
+                        "family": "llama",
+                        "parameter_size": "7B",
+                        "quantization_level": "Q4_0"
+                    }
+                }
+            ]
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/api/ps"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(mock_response))
+            .mount(&mock_server)
+            .await;
+
+        let running = client
+            .list_running()
+            .await
+            .expect("Failed to list running models");
+
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].name, "llama2:latest");
+        assert_eq!(running[0].size_vram, 4000000000);
     }
 }

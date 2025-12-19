@@ -13,6 +13,15 @@ pub struct Config {
     pub system_prompt: String,
     #[serde(default = "default_ignored_patterns")]
     pub ignored_patterns: Vec<String>,
+    /// Whether to automatically detect optimal context size based on system resources
+    #[serde(default = "default_auto_context")]
+    pub auto_context: bool,
+    /// Whether to enable automatic conversation summarization
+    #[serde(default = "default_summarization_enabled")]
+    pub summarization_enabled: bool,
+    /// Threshold (0.0-1.0) at which to trigger summarization
+    #[serde(default = "default_summarization_threshold")]
+    pub summarization_threshold: f32,
 }
 
 fn default_ollama_url() -> String {
@@ -24,7 +33,25 @@ fn default_context_token_limit() -> usize {
 }
 
 fn default_system_prompt() -> String {
-    "You are a helpful AI assistant.".to_string()
+    r#"You are a helpful AI coding assistant with access to file system tools.
+
+## CRITICAL: ACTION FIRST
+When the user asks you to do something with files or search for something:
+1. USE YOUR TOOLS IMMEDIATELY - do not explain how you would use them
+2. Execute the search/action first, THEN explain what you found
+
+## Response Formatting
+- Use Markdown for all responses
+- Wrap code in fenced code blocks with language tags
+- Be concise - avoid unnecessary verbosity
+
+## Important Rules
+1. EXECUTE tools immediately when asked to search/find something
+2. Use case_insensitive=true when user asks for case-insensitive search
+3. Use ~ or ~/Documents for user document searches
+4. After getting results, summarize them clearly
+5. Do NOT call the same tool with same arguments twice"#
+        .to_string()
 }
 
 fn default_ignored_patterns() -> Vec<String> {
@@ -34,7 +61,25 @@ fn default_ignored_patterns() -> Vec<String> {
         "node_modules".to_string(),
         ".env".to_string(),
         ".DS_Store".to_string(),
+        "Library".to_string(),
+        "Music".to_string(),
+        "Movies".to_string(),
+        "Pictures".to_string(),
+        "dist".to_string(),
+        "build".to_string(),
     ]
+}
+
+fn default_auto_context() -> bool {
+    true
+}
+
+fn default_summarization_enabled() -> bool {
+    true
+}
+
+fn default_summarization_threshold() -> f32 {
+    0.8
 }
 
 impl Config {
@@ -67,6 +112,9 @@ impl Config {
             context_token_limit: default_context_token_limit(),
             system_prompt: default_system_prompt(),
             ignored_patterns: default_ignored_patterns(),
+            auto_context: default_auto_context(),
+            summarization_enabled: default_summarization_enabled(),
+            summarization_threshold: default_summarization_threshold(),
         })
     }
 }

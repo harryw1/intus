@@ -35,8 +35,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Config {
             ollama_url: "http://localhost:11434".to_string(),
             context_token_limit: 4096,
-            system_prompt: "You are a helpful AI assistant.".to_string(),
+            system_prompt: "You are a helpful AI assistant with access to local system tools. You can read/write files and run commands. Use these tools whenever real-world interaction is needed.".to_string(),
             ignored_patterns: vec![],
+            auto_context: true,
+            summarization_enabled: true,
+            summarization_threshold: 0.8,
         }
     });
 
@@ -77,7 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initial load
     let _ = action_tx.send(Action::LoadModels);
 
-    let res = run_app(&mut terminal, &mut app, &mut action_rx).await;
+    let res = run_app(&mut terminal, &mut app, &mut action_rx, action_tx.clone()).await;
 
     // Restore
     disable_raw_mode()?;
@@ -93,14 +96,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Err(err) = res {
         eprintln!("Error: {}", err);
+        std::process::exit(1);
     }
-    Ok(())
+    std::process::exit(0);
 }
 
 async fn run_app<B: Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App<'_>,
     action_rx: &mut mpsc::UnboundedReceiver<Action>,
+    action_tx: mpsc::UnboundedSender<Action>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut last_tick = std::time::Instant::now();
     let tick_rate = std::time::Duration::from_millis(100);
@@ -132,6 +137,10 @@ async fn run_app<B: Backend>(
                      terminal.draw(|f| ui(f, app))?;
                  }
                  last_tick = std::time::Instant::now();
+            }
+            // Handle Ctrl+C gracefully - save session before exiting
+            _ = tokio::signal::ctrl_c() => {
+                let _ = action_tx.send(Action::PrepareQuit);
             }
         }
     }

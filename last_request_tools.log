@@ -1,0 +1,171 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "find_files",
+      "description": "USE THIS to search for files by name pattern. Examples: name='*.rs' finds Rust files, name='config*' finds config files. Searches recursively. Use path to limit search scope.",
+      "parameters": {
+        "properties": {
+          "name": {
+            "description": "The file name pattern to search for (e.g. '*.rs', 'config.json')",
+            "type": "string"
+          },
+          "path": {
+            "description": "The directory to search in (default: current directory).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "list_directory",
+      "description": "USE THIS to see what files/folders exist in a directory. Shows file sizes and dates. Use this FIRST to explore an unfamiliar directory before using other tools.",
+      "parameters": {
+        "properties": {
+          "path": {
+            "description": "The directory path to list (default: current directory).",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "replace_text",
+      "description": "USE THIS to replace specific text in a file. Input: path, old_text (exact match), new_text. Will fail if old_text is not found or not unique.",
+      "parameters": {
+        "properties": {
+          "new_text": {
+            "description": "The new text to insert in place of old_text.",
+            "type": "string"
+          },
+          "old_text": {
+            "description": "The exact text block to be replaced.",
+            "type": "string"
+          },
+          "path": {
+            "description": "The file path to edit.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "old_text",
+          "new_text"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "write_file",
+      "description": "USE THIS to create NEW files or OVERWRITE existing files. Input: path (full filepath), content (text to write). Do not use this for minor edits, use replace_text instead.",
+      "parameters": {
+        "properties": {
+          "content": {
+            "description": "The full content to write to the file.",
+            "type": "string"
+          },
+          "path": {
+            "description": "The file path to write to.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "content"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "run_command",
+      "description": "USE THIS to execute shell commands. Safe commands like 'ls', 'git', 'cargo' are allowed. Input: command (program) and args (list of arguments). Example: command='git', args=['status']",
+      "parameters": {
+        "properties": {
+          "args": {
+            "description": "List of arguments to pass to the command.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "command": {
+            "description": "The command/program to run (e.g. 'git', 'cargo', 'ls').",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command",
+          "args"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "read_file",
+      "description": "USE THIS to read the full contents of a file. Use AFTER find_files or list_directory to get the actual file path. Returns the file text content.",
+      "parameters": {
+        "properties": {
+          "path": {
+            "description": "The path to the file to read.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "grep_files",
+      "description": "USE THIS to search for text INSIDE files. Finds function definitions, variable usages, error messages, etc. Set case_insensitive=true for case-insensitive search. Example: pattern='health score', case_insensitive=true",
+      "parameters": {
+        "properties": {
+          "case_insensitive": {
+            "description": "Set to true for case-insensitive matching (default: false).",
+            "type": "boolean"
+          },
+          "path": {
+            "description": "The directory to search in. Use '~' for home directory, '~/Documents' for documents. Default: current directory.",
+            "type": "string"
+          },
+          "pattern": {
+            "description": "The text pattern to search for (e.g., 'TODO', 'fn main', 'error').",
+            "type": "string"
+          },
+          "recursive": {
+            "description": "Whether to search recursively in subdirectories (default: true).",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "pattern"
+        ],
+        "type": "object"
+      }
+    }
+  }
+]
