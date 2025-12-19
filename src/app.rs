@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::process::ProcessTracker;
 use crate::context::ContextManager;
 use crate::ollama::{ChatMessage, ChatMessageRequest, ChatStreamEvent, OllamaClient, ToolCall};
 use crate::tools::{CatTool, FileSearchTool, GrepTool, ListDirectoryTool, ReplaceTextTool, RunCommandTool, SemanticSearchTool, Tool, WebSearchTool, WriteFileTool};
@@ -153,6 +154,7 @@ pub struct App<'a> {
     // UX
     pub notification: Option<(String, std::time::Instant)>,
     pub theme: crate::theme::Theme,
+    pub process_tracker: Arc<ProcessTracker>,
 }
 
 /// Maximum number of consecutive tool calls before forcing a text response
@@ -169,6 +171,10 @@ impl<'a> App<'a> {
         // Disable default cursor line style (underline)
         textarea.set_cursor_line_style(Style::default());
         textarea.set_placeholder_text("Type a message...");
+
+        textarea.set_placeholder_text("Type a message...");
+
+        let process_tracker = Arc::new(ProcessTracker::new());
 
         let mut tools: HashMap<String, Arc<dyn Tool>> = HashMap::new();
         tools.insert(
@@ -245,6 +251,7 @@ impl<'a> App<'a> {
                     "cp".to_string(),
                     "stat".to_string(),
                 ],
+                process_tracker: process_tracker.clone(),
             }),
         );
 
@@ -293,6 +300,7 @@ impl<'a> App<'a> {
             clipboard: Clipboard::new().ok(),
             notification: None,
             theme: crate::theme::Theme::default(),
+            process_tracker,
         };
 
         if load_history {

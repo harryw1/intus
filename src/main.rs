@@ -13,9 +13,14 @@ use tokio::sync::mpsc;
 use ollama_tui::app::{Action, App};
 use ollama_tui::config::Config;
 use ollama_tui::ui::ui;
+use std::fs::OpenOptions; // For debug logging
+use std::io::Write; // For debug logging & flush
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Debug Log Setup
+    let _ = std::fs::write("debug_log.txt", "Starting app...\n");
+
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -85,6 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let res = run_app(&mut terminal, &mut app, &mut action_rx, action_tx.clone()).await;
 
     // Restore
+    let _ = std::fs::OpenOptions::new().append(true).open("debug_log.txt").map(|mut f| writeln!(f, "Restoring terminal..."));
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -93,8 +99,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     terminal.show_cursor()?;
 
+    let _ = std::fs::OpenOptions::new().append(true).open("debug_log.txt").map(|mut f| writeln!(f, "Aborting input task..."));
     // Explicitly abort the input task to ensure the process exits
     input_handle.abort();
+
+    let _ = std::fs::OpenOptions::new().append(true).open("debug_log.txt").map(|mut f| writeln!(f, "Killing child processes..."));
+    // Kill any lingering child processes spawned by tools
+    app.process_tracker.kill_all();
+
+    let _ = std::fs::OpenOptions::new().append(true).open("debug_log.txt").map(|mut f| writeln!(f, "Flushing stdout..."));
+    let _ = std::io::stdout().flush();
+
+    let _ = std::fs::OpenOptions::new().append(true).open("debug_log.txt").map(|mut f| writeln!(f, "Exiting..."));
 
     if let Err(err) = res {
         eprintln!("Error: {}", err);

@@ -2,7 +2,9 @@ use crate::ollama::{ToolDefinition, ToolFunction};
 use anyhow::Result;
 use directories::BaseDirs;
 use serde_json::Value;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use crate::process::ProcessTracker;
+
 
 /// Expands `~` at the start of a path to the user's home directory.
 /// Returns the original path if no tilde or home directory not found.
@@ -935,6 +937,7 @@ impl Tool for ReplaceTextTool {
 
 pub struct RunCommandTool {
     pub allowed_commands: Vec<String>,
+    pub process_tracker: Arc<ProcessTracker>,
 }
 
 // ... impl RunCommandTool ...
@@ -1018,25 +1021,44 @@ impl Tool for RunCommandTool {
             // Reconstruct the full command string
             let full_command = format!("{} {}", command_name, cmd_args.join(" "));
             
-            if cfg!(target_os = "windows") {
+            let child = if cfg!(target_os = "windows") {
                 Command::new("cmd")
                     .arg("/C")
                     .arg(&full_command)
-                    .stdin(std::process::Stdio::null())
-                    .output()?
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()?
             } else {
                 Command::new("sh")
                     .arg("-c")
                     .arg(&full_command)
-                    .stdin(std::process::Stdio::null())
-                    .output()?
-            }
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()?
+            };
+
+            let pid = child.id();
+            self.process_tracker.add_pid(pid);
+            let result = child.wait_with_output();
+            self.process_tracker.remove_pid(pid);
+            result?
         } else {
              // Safe direct execution
             let mut cmd = Command::new(command_name);
-            cmd.stdin(std::process::Stdio::null()); // Ensure no stdin blocking
+            cmd.stdin(Stdio::null()); // Ensure no stdin blocking
+            cmd.stdout(Stdio::piped());
+            cmd.stderr(Stdio::piped());
             cmd.args(&cmd_args);
-            cmd.output()?
+            
+            let child = cmd.spawn()?;
+            let pid = child.id();
+            
+            self.process_tracker.add_pid(pid);
+            let result = child.wait_with_output();
+            self.process_tracker.remove_pid(pid);
+            result?
         };
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1248,8 +1270,10 @@ mod tests {
 
     #[test]
     fn test_run_command_shell_piping() -> Result<()> {
+        let tracker = Arc::new(ProcessTracker::new());
         let tool = RunCommandTool {
             allowed_commands: vec!["echo".to_string(), "grep".to_string()],
+            process_tracker: tracker,
         };
         // This command uses piping, so it should trigger the shell path.
         // The allowed_commands check passes because "echo" is allowed.
@@ -1265,8 +1289,10 @@ mod tests {
 
     #[test]
     fn test_run_command_shell_piping_fail_allowlist() -> Result<()> {
+        let tracker = Arc::new(ProcessTracker::new());
         let tool = RunCommandTool {
             allowed_commands: vec!["ls".to_string()],
+            process_tracker: tracker,
         };
         // "echo" is not allowed, so it should fail even if piping is used
         let args = serde_json::json!({
