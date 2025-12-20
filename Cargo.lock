@@ -1400,7 +1400,7 @@ dependencies = [
 
 [[package]]
 name = "intus"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "anyhow",
  "arboard",
