@@ -1,5 +1,5 @@
 //! Tests for markdown rendering functionality
-//!
+//! 
 //! These tests verify that markdown content is parsed and rendered correctly,
 //! including code blocks, inline code, and line wrapping calculations.
 
@@ -24,7 +24,7 @@ fn estimate_wrapped_height(text: &Text, width: u16) -> u16 {
 
 #[test]
 fn test_code_block_parsing() {
-    let markdown = r#"Here is some code:
+    let markdown = r###"Here is some code:
 
 ```rust
 fn main() {
@@ -32,7 +32,7 @@ fn main() {
 }
 ```
 
-And some text after."#;
+And some text after."###;
 
     let text = tui_markdown::from_str(markdown);
 
@@ -130,9 +130,9 @@ fn test_wrapped_height_empty_lines() {
 
 #[test]
 fn test_long_code_line_wrapping() {
-    let markdown = r#"```
+    let markdown = r###"```
 let very_long_variable_name = some_function_with_long_name(parameter1, parameter2, parameter3);
-```"#;
+```"###;
 
     let text = tui_markdown::from_str(markdown);
 
@@ -168,9 +168,9 @@ fn test_bold_italic_parsing() {
 
 #[test]
 fn test_list_parsing() {
-    let markdown = r#"- Item 1
+    let markdown = r###"- Item 1
 - Item 2
-- Item 3"#;
+- Item 3"###;
 
     let text = tui_markdown::from_str(markdown);
 

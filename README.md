@@ -32,6 +32,23 @@
 
 ### Installation
 
+### Homebrew
+
+```bash
+# Register the tap (if you create one)
+brew tap fiesty/tap
+brew install tenere
+
+# Or install directly from the formula
+brew install --HEAD ./homebrew/tenere.rb
+```
+
+### Binaries
+
+Download the latest pre-built binary for macOS or Linux from the [Releases](https://github.com/fiesty/tenere/releases) page.
+
+### From Source
+
 ```bash
 git clone https://github.com/fiesty/tenere.git
 cd tenere

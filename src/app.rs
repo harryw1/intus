@@ -56,7 +56,7 @@ fn get_system_context(location: Option<&str>) -> String {
         .unwrap_or_default();
 
     format!(
-        "\n\n[System Context]\nDate: {}\nTime: {} ({})\n{}OS: {}\nHome Directory: {}\nCurrent Working Directory: {}\n\nWhen using file system tools, use these actual paths instead of guessing. For example, use '{}' instead of '/home/user'.",
+        "\n\n[System Context]\nCurrent Date: {}\nCurrent Time: {} ({})\n{}OS: {}\nHome Directory: {}\nCurrent Working Directory: {}\n\nWhen using file system tools, use these actual paths instead of guessing. For example, use '{}' instead of '/home/user'.",
         date_str, time_str, timezone, location_str, os, home_dir, cwd, home_dir
     )
 }
@@ -430,6 +430,22 @@ impl<'a> App<'a> {
                     "mv".to_string(),
                     "cp".to_string(),
                     "stat".to_string(),
+                    "curl".to_string(),
+                    "wget".to_string(),
+                    "jq".to_string(),
+                    "sed".to_string(),
+                    "awk".to_string(),
+                    "python3".to_string(),
+                    "node".to_string(),
+                    "tree".to_string(),
+                    "du".to_string(),
+                    "chmod".to_string(),
+                    "brew".to_string(),
+                    "uv".to_string(),
+                    "which".to_string(),
+                    "cat".to_string(),
+                    "head".to_string(),
+                    "tail".to_string(),
                 ],
                 process_tracker: process_tracker.clone(),
             }),
@@ -1695,10 +1711,12 @@ impl<'a> App<'a> {
                         }
                         KeyCode::F(1) => self.show_help = true,
                         _ => {
-                            if key.code == KeyCode::Enter
-                                && !key.modifiers.contains(KeyModifiers::SHIFT)
-                            {
-                                let _ = self.action_tx.send(Action::SendMessage);
+                            if key.code == KeyCode::Enter {
+                                if key.modifiers.contains(KeyModifiers::SHIFT) || key.modifiers.contains(KeyModifiers::ALT) {
+                                    self.input.insert_newline();
+                                } else {
+                                    let _ = self.action_tx.send(Action::SendMessage);
+                                }
                             } else if key.code == KeyCode::Char('o')
                                 && key.modifiers.contains(KeyModifiers::CONTROL)
                             {

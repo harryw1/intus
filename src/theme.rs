@@ -37,11 +37,75 @@ pub struct Theme {
 
 impl Default for Theme {
     fn default() -> Self {
-        Self::terminal()
+        Self::catppuccin_frappe()
     }
 }
 
 impl Theme {
+    pub fn catppuccin_frappe() -> Self {
+        // Catppuccin Frappe Palette
+        let _rosewater = Color::Rgb(242, 213, 207);
+        let _flamingo = Color::Rgb(238, 190, 190);
+        let _pink = Color::Rgb(244, 184, 228);
+        let mauve = Color::Rgb(202, 158, 230);
+        let red = Color::Rgb(231, 130, 132);
+        let _maroon = Color::Rgb(234, 153, 156);
+        let peach = Color::Rgb(239, 159, 118);
+        let yellow = Color::Rgb(229, 200, 144);
+        let _green = Color::Rgb(166, 209, 137);
+        let teal = Color::Rgb(129, 200, 190);
+        let _sky = Color::Rgb(153, 209, 219);
+        let _sapphire = Color::Rgb(133, 193, 220);
+        let _blue = Color::Rgb(140, 170, 238);
+        let lavender = Color::Rgb(186, 187, 241);
+        let text = Color::Rgb(198, 208, 245);
+        let _subtext1 = Color::Rgb(181, 191, 226);
+        let subtext0 = Color::Rgb(165, 173, 206);
+        let _overlay2 = Color::Rgb(148, 156, 187);
+        let overlay0 = Color::Rgb(115, 121, 148);
+        let surface0 = Color::Rgb(65, 69, 89);
+        // let base = Color::Rgb(48, 52, 70); // We use Reset for transparency
+
+        Self {
+            app_bg: Color::Reset, // Transparent background
+            primary_fg: text,
+            secondary_fg: subtext0,
+
+            // Header
+            header_bg: Color::Reset,
+            header_fg: lavender,
+            header_border: overlay0,
+
+            // Footer
+            status_bar_bg: surface0, // Slight contrast for bar
+            status_bar_fg: text,
+
+            // Chat
+            // User: Teal theme
+            user_bubble_bg: Color::Reset,
+            user_bubble_fg: text,
+            user_bubble_border: teal,
+
+            // AI: Lavender theme
+            ai_bubble_bg: Color::Reset,
+            ai_bubble_fg: text,
+            ai_bubble_border: lavender,
+
+            // Tool: Peach/Yellow
+            tool_bubble_bg: Color::Reset,
+            tool_bubble_fg: peach,
+
+            // Input
+            input_border_normal: overlay0,
+            input_border_active: mauve, // Active focus is Mauve
+            input_border_error: red,
+
+            // Modals
+            modal_bg: Color::Reset,
+            modal_border: yellow,
+        }
+    }
+
     pub fn modern() -> Self {
         Self {
             app_bg: Color::Reset,

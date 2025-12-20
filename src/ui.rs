@@ -7,6 +7,147 @@ use ratatui::{
     Frame,
 };
 use throbber_widgets_tui::Throbber;
+use comrak::{parse_document, Arena, Options, nodes::{AstNode, NodeValue, ListType}, markdown_to_html};
+
+fn markdown_to_text(markdown: &str, width: u16) -> Text<'static> {
+    let arena = Arena::new();
+    let mut options = Options::default();
+    options.extension.table = true;
+    options.extension.strikethrough = true;
+    options.extension.autolink = true;
+    options.extension.tasklist = true;
+    
+    let root = parse_document(&arena, markdown, &options);
+    let mut lines = Vec::new();
+    let mut current_line = Vec::new();
+
+    fn walk<'a>(
+        node: &'a AstNode<'a>,
+        current_line: &mut Vec<Span<'static>>,
+        lines: &mut Vec<ratatui::text::Line<'static>>,
+        style: Style,
+        width: u16,
+        indent: usize,
+        options: &Options,
+    ) {
+        match &node.data.borrow().value {
+            NodeValue::Text(text) => {
+                current_line.push(Span::styled(text.clone(), style));
+            }
+            NodeValue::Code(code) => {
+                current_line.push(Span::styled(format!(" {} ", code.literal), style.bg(Color::Rgb(65, 69, 89)).fg(Color::Rgb(242, 213, 207))));
+            }
+            NodeValue::Emph => {
+                for child in node.children() {
+                    walk(child, current_line, lines, style.add_modifier(Modifier::ITALIC), width, indent, options);
+                }
+            }
+            NodeValue::Strong => {
+                for child in node.children() {
+                    walk(child, current_line, lines, style.add_modifier(Modifier::BOLD), width, indent, options);
+                }
+            }
+            NodeValue::Link(link) => {
+                 current_line.push(Span::styled("[", style));
+                 for child in node.children() {
+                     walk(child, current_line, lines, style.fg(Color::Cyan).add_modifier(Modifier::UNDERLINED), width, indent, options);
+                 }
+                 current_line.push(Span::styled(format!("]({})", link.url), style.fg(Color::DarkGray)));
+            }
+            NodeValue::Paragraph => {
+                for child in node.children() {
+                    walk(child, current_line, lines, style, width, indent, options);
+                }
+                if !current_line.is_empty() {
+                    lines.push(ratatui::text::Line::from(current_line.drain(..).collect::<Vec<_>>()));
+                }
+                lines.push(ratatui::text::Line::from(""));
+            }
+            NodeValue::Heading(h) => {
+                let h_style = style.add_modifier(Modifier::BOLD).fg(match h.level {
+                    1 => Color::Magenta,
+                    2 => Color::Blue,
+                    _ => Color::Cyan,
+                });
+                current_line.push(Span::styled("#".repeat(h.level as usize) + " ", h_style));
+                for child in node.children() {
+                    walk(child, current_line, lines, h_style, width, indent, options);
+                }
+                lines.push(ratatui::text::Line::from(current_line.drain(..).collect::<Vec<_>>()));
+                lines.push(ratatui::text::Line::from(""));
+            }
+            NodeValue::List(l) => {
+                let mut item_index = l.start;
+                for child in node.children() {
+                    let prefix = match l.list_type {
+                        ListType::Bullet => " • ".to_string(),
+                        ListType::Ordered => format!(" {}. ", item_index),
+                    };
+                    let mut item_line = Vec::new();
+                    item_line.push(Span::styled(prefix, style.fg(Color::Yellow)));
+                    
+                    // Walk list item content
+                    walk(child, &mut item_line, lines, style, width, indent + 3, options);
+                    
+                    if !item_line.is_empty() {
+                         lines.push(ratatui::text::Line::from(item_line));
+                    }
+                    item_index += 1;
+                }
+                lines.push(ratatui::text::Line::from(""));
+            }
+            NodeValue::Item(_) => {
+                for child in node.children() {
+                    walk(child, current_line, lines, style, width, indent, options);
+                }
+            }
+            NodeValue::CodeBlock(cb) => {
+                lines.push(ratatui::text::Line::from(vec![Span::styled(format!("── {} ──", cb.info), style.fg(Color::DarkGray))]));
+                for line in cb.literal.lines() {
+                    lines.push(ratatui::text::Line::from(vec![Span::styled(line.to_string(), style.fg(Color::Rgb(166, 209, 137)))]));
+                }
+                lines.push(ratatui::text::Line::from(vec![Span::styled("────────────────", style.fg(Color::DarkGray))]));
+                lines.push(ratatui::text::Line::from(""));
+            }
+            NodeValue::Table(_) => {
+                let mut buf = Vec::new();
+                comrak::format_commonmark(node, options, &mut buf).unwrap();
+                let commonmark = String::from_utf8(buf).unwrap();
+                
+                let html = markdown_to_html(&commonmark, options);
+                let text = html2text::from_read(html.as_bytes(), width.saturating_sub(4) as usize);
+                
+                for line in text.lines() {
+                    lines.push(ratatui::text::Line::from(vec![Span::styled(line.to_string(), style.fg(Color::Rgb(129, 200, 190)))]));
+                }
+                lines.push(ratatui::text::Line::from(""));
+            }
+            NodeValue::SoftBreak | NodeValue::LineBreak => {
+                // Ignore or handle? Usually handled by Line::from
+            }
+            _ => {
+                for child in node.children() {
+                    walk(child, current_line, lines, style, width, indent, options);
+                }
+            }
+        }
+    }
+
+    for child in root.children() {
+        walk(child, &mut current_line, &mut lines, Style::default(), width, 0, &options);
+    }
+    
+    // Clean up trailing empty lines
+    while let Some(last) = lines.last() {
+        if last.width() == 0 {
+            lines.pop();
+        } else {
+            break;
+        }
+    }
+
+    Text::from(lines)
+}
 
 pub fn ui(f: &mut Frame, app: &mut App) {
     let size = f.area();
@@ -157,24 +298,18 @@ fn render_chat_history(f: &mut Frame, app: &mut App, area: Rect) {
                 msg.content.clone()
             };
 
-            let md_borrowed = tui_markdown::from_str(&content_to_render);
-            let md = to_owned_text(md_borrowed);
+            let text = markdown_to_text(&content_to_render, max_available_width);
             
             // Calculate content width
-            // We want the bubble to fit the content, up to max_available_width.
-            // Minimum width of e.g. 10 chars to avoid tiny bubbles.
-            let content_text_width = md.lines.iter().map(|l| l.width()).max().unwrap_or(0) as u16;
+            let content_text_width = text.lines.iter().map(|l| l.width()).max().unwrap_or(0) as u16;
             
-            // Add padding (2 for borders, maybe 2 for internal padding)
-            // Let's assume Borders take 2.
             let required_width = content_text_width.saturating_add(4); // +4 for safe padding inside borders
-            
             let bubble_width = required_width.clamp(14, max_available_width);
             let wrapping_width = bubble_width.saturating_sub(4); // Inner width for text wrapping
 
-            let height = estimate_wrapped_height(&md, wrapping_width) + 2; // +2 for border height
+            let height = estimate_wrapped_height(&text, wrapping_width) + 2; // +2 for border height
 
-            calculated_msgs.push((height, Some(md), None, bubble_width));
+            calculated_msgs.push((height, Some(text), None, bubble_width));
             total_height += height;
         }
     }
@@ -194,16 +329,18 @@ fn render_chat_history(f: &mut Frame, app: &mut App, area: Rect) {
 
     // Scroll Logic
     let viewport_height = history_area.height;
+    let max_scroll = total_height.saturating_sub(viewport_height);
+
     if app.auto_scroll {
         if total_height > viewport_height {
-            app.vertical_scroll = total_height - viewport_height;
+            app.vertical_scroll = max_scroll;
         } else {
             app.vertical_scroll = 0;
         }
     } else {
-        let max_scroll = total_height.saturating_sub(viewport_height);
-        if app.vertical_scroll > max_scroll {
+        if app.vertical_scroll >= max_scroll {
             app.vertical_scroll = max_scroll;
+            app.auto_scroll = true;
         }
     }
 
@@ -435,7 +572,7 @@ fn render_help_popup(f: &mut Frame, app: &App, size: Rect) {
         Row::new(vec!["", ""]),
         Row::new(vec!["Insert Mode", ""]),
         Row::new(vec![" Enter", "Send Message"]),
-        Row::new(vec![" Shift+Enter", "New Line"]),
+        Row::new(vec![" Shift/Alt+Enter", "New Line"]),
         Row::new(vec![" Esc", "Normal Mode"]),
         Row::new(vec!["", ""]),
         Row::new(vec!["Normal Mode", ""]),
@@ -617,16 +754,6 @@ fn estimate_wrapped_height(text: &Text, width: u16) -> u16 {
         }
     }
     height
-}
-
-fn to_owned_text(text: Text) -> Text<'static> {
-    let lines: Vec<_> = text.lines.into_iter().map(|line| {
-        let spans: Vec<_> = line.spans.into_iter().map(|span| {
-            Span::styled(span.content.into_owned(), span.style)
-        }).collect();
-        ratatui::text::Line::from(spans)
-    }).collect();
-    Text::from(lines)
 }
 
 fn insert_soft_hyphens(text: &str) -> String {
