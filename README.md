@@ -1,8 +1,9 @@
-# Tenere
+# Intus
 
-> **Tenere**: (Latin) To hold, keep, know, preserve.
+> **Intus**: (Latin) Within, inside, inward.
 
-**Tenere** is a robust, privacy-first Local Autonomous Agent and System Sidecar for your terminal. It empowers you to interact with your local file system, knowledge bases, and the web through a context-aware AI interface, all while keeping your data strictly local (via [Ollama](https://ollama.com/)).
+
+**Intus** is a robust, privacy-first Local Autonomous Agent and System Sidecar for your terminal. It empowers you to interact with your local file system, knowledge bases, and the web through a context-aware AI interface, all while keeping your data strictly local (via [Ollama](https://ollama.com/)).
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 
@@ -36,29 +37,29 @@
 
 ```bash
 # Register the tap (if you create one)
-brew tap fiesty/tap
-brew install tenere
+brew tap harryw1/intus
+brew install intus
 
 # Or install directly from the formula
-brew install --HEAD ./homebrew/tenere.rb
+brew install --HEAD https://raw.githubusercontent.com/harryw1/intus/master/homebrew/intus.rb
 ```
 
 ### Binaries
 
-Download the latest pre-built binary for macOS or Linux from the [Releases](https://github.com/fiesty/tenere/releases) page.
+Download the latest pre-built binary for macOS or Linux from the [Releases](https://github.com/harryw1/intus/releases) page.
 
 ### From Source
 
 ```bash
-git clone https://github.com/fiesty/tenere.git
-cd tenere
+git clone https://github.com/harryw1/intus.git
+cd intus
 cargo build --release
-./target/release/tenere
+./target/release/intus
 ```
 
 ### Configuration
 
-Tenere creates a config file at `~/.config/tenere/config.toml` on first run.
+Intus creates a config file at `~/.config/intus/config.toml` on first run.
 
 **Recommended Setup:**
 
@@ -87,7 +88,7 @@ searxng_url = "http://localhost:8080"
 
 ## 🛠️ Architecture
 
-Tenere is built with the Rust TUI ecosystem:
+Intus is built with the Rust TUI ecosystem:
 - **Ratatui**: UI Rendering.
 - **Tokio**: Async runtime for non-blocking tools.
 - **Local Embeddings**: Uses `nomic-embed-text` (via Ollama) for vector search.

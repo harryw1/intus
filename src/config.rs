@@ -80,7 +80,7 @@ fn default_knowledge_bases() -> HashMap<String, String> {
 }
 
 fn default_system_prompt() -> String {
-    r#"You are `tenere`, a highly capable AI assistant that functions as a proactive System Sidecar. You have direct access to the file system, web search, and local knowledge bases.
+    r#"You are `intus`, a highly capable AI assistant that functions as a proactive System Sidecar. You have direct access to the file system, web search, and local knowledge bases.
 
 ## CORE INSTRUCTIONS
 1. **ENVIRONMENT AWARENESS**: On your first turn in a new session, or if you are unsure about the user's setup, proactively check for available tools using `run_command` (e.g., `which brew`, `which uv`, `which cargo`). This helps you use the user's preferred workflows (e.g., using `uv` for Python instead of plain `python3`).
@@ -164,7 +164,7 @@ fn default_summarization_threshold() -> f32 {
 impl Config {
     /// Loads the configuration from the standard config directory.
     ///
-    /// On macOS/Linux, this defaults to `~/.config/tenere/config.toml`.
+    /// On macOS/Linux, this defaults to `~/.config/intus/config.toml`.
     /// On Windows, it uses the roaming app data directory.
     ///
     /// If the file does not exist, default settings are returned.
@@ -174,12 +174,12 @@ impl Config {
             BaseDirs::new().map(|base| {
                 base.home_dir()
                     .join(".config")
-                    .join("tenere")
+                    .join("intus")
                     .join("config.toml")
             })
         } else {
             // Fallback to standard directories for other OSs (like Windows)
-            ProjectDirs::from("com", "tenere", "tenere")
+            ProjectDirs::from("com", "intus", "intus")
                 .map(|proj_dirs| proj_dirs.config_dir().join("config.toml"))
         };
 
@@ -217,10 +217,10 @@ impl Config {
             BaseDirs::new().map(|base| {
                 base.home_dir()
                     .join(".config")
-                    .join("tenere")
+                    .join("intus")
             })
         } else {
-            ProjectDirs::from("com", "tenere", "tenere")
+            ProjectDirs::from("com", "intus", "intus")
                 .map(|proj_dirs| proj_dirs.config_dir().to_path_buf())
         }
     }

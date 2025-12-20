@@ -60,7 +60,7 @@ IMPORTANT:
         
         if let Some(url) = url_arg {
              let response = client.get(url)
-                 .header("User-Agent", "Mozilla/5.0 (compatible; Tenere/1.0; +https://github.com/fiesty/tenere)")
+                 .header("User-Agent", "Mozilla/5.0 (compatible; Intus/1.0; +https://github.com/harryw1/intus)")
                  .send()?;
             if !response.status().is_success() {
                 return Err(anyhow::anyhow!("Failed to fetch URL: {}", response.status()));
@@ -185,7 +185,7 @@ If NO query is provided, the tool returns the start of the page and INDEXES the 
         });
         
         let response = client.get(url)
-            .header("User-Agent", "Mozilla/5.0 (compatible; Tenere/1.0; +https://github.com/fiesty/tenere)")
+            .header("User-Agent", "Mozilla/5.0 (compatible; Intus/1.0; +https://github.com/harryw1/intus)")
             .send()?;
 
         if !response.status().is_success() {

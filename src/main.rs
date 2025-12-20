@@ -15,10 +15,10 @@ use ratatui::{
 use std::io;
 use tokio::sync::mpsc;
 
-use tenere::app::{Action, App};
-use tenere::config::Config;
-use tenere::ui::ui;
-use tenere::logging;
+use intus::app::{Action, App};
+use intus::config::Config;
+use intus::ui::ui;
+use intus::logging;
 use tracing::{info, warn};
 use std::io::Write;
 
@@ -35,7 +35,7 @@ use std::io::Write;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
     let _ = logging::init_logging();
-    info!("Starting Tenere");
+    info!("Starting Intus");
 
     // Load config
     enable_raw_mode()?;

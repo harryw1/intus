@@ -1399,6 +1399,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "intus"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "arboard",
+ "bytes",
+ "chrono",
+ "color-eyre",
+ "comrak",
+ "crossterm",
+ "directories",
+ "futures",
+ "html2text",
+ "ignore",
+ "ratatui",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sysinfo",
+ "tempfile",
+ "throbber-widgets-tui",
+ "tokio",
+ "tokio-stream",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "tui-markdown",
+ "tui-textarea",
+ "wiremock",
+]
+
+[[package]]
 name = "ipnet"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2783,38 +2815,6 @@ dependencies = [
  "futf",
  "mac",
  "utf-8",
-]
-
-[[package]]
-name = "tenere"
-version = "1.0.0"
-dependencies = [
- "anyhow",
- "arboard",
- "bytes",
- "chrono",
- "color-eyre",
- "comrak",
- "crossterm",
- "directories",
- "futures",
- "html2text",
- "ignore",
- "ratatui",
- "reqwest",
- "serde",
- "serde_json",
- "sysinfo",
- "tempfile",
- "throbber-widgets-tui",
- "tokio",
- "tokio-stream",
- "toml",
- "tracing",
- "tracing-subscriber",
- "tui-markdown",
- "tui-textarea",
- "wiremock",
 ]
 
 [[package]]

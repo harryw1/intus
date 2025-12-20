@@ -1,5 +1,5 @@
-use ollama_tui::app::{Action, App};
-use ollama_tui::config::Config;
+use intus::app::{Action, App};
+use intus::config::Config;
 use std::fs;
 use tempfile::tempdir;
 use tokio::sync::mpsc;

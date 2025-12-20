@@ -8,7 +8,7 @@ pub fn init_logging() -> anyhow::Result<()> {
         BaseDirs::new().map(|base| {
             base.home_dir()
                 .join(".config")
-                .join("tenere")
+                .join("intus")
                 .join("logs")
         })
     } else {
@@ -18,7 +18,7 @@ pub fn init_logging() -> anyhow::Result<()> {
 
     if let Some(dir) = log_dir {
         std::fs::create_dir_all(&dir)?;
-        let log_file = dir.join("tenere.log");
+        let log_file = dir.join("intus.log");
         let file = File::create(log_file)?;
         
         let file_layer = fmt::layer()

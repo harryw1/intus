@@ -1,12 +1,12 @@
 [package]
-name = "tenere"
+name = "intus"
 version = "1.0.0"
 edition = "2021"
 description = "A robust, privacy-first local AI assistant and system sidecar."
 authors = ["Harry Weiss"]
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/fiesty/tenere"
+repository = "https://github.com/harryw1/intus"
 keywords = ["ollama", "tui", "ai", "agent", "local"]
 categories = ["command-line-utilities", "text-processing"]
 

@@ -1,5 +1,5 @@
-use ollama_tui::rag::RagSystem;
-use ollama_tui::ollama::OllamaClient;
+use intus::rag::RagSystem;
+use intus::ollama::OllamaClient;
 use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -34,7 +34,7 @@ async fn test_rag_persistence() {
             Some(storage_path.clone()),
         );
 
-        rag.add_text("Persistent Memory Test Content").await.expect("Add text failed");
+        rag.add_text("Persistent Memory Test Content", None).await.expect("Add text failed");
         assert!(storage_path.exists(), "File should have been created");
     }
 

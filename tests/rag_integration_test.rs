@@ -1,6 +1,6 @@
-use ollama_tui::tools::{Tool, ReadUrlTool};
-use ollama_tui::rag::RagSystem;
-use ollama_tui::ollama::OllamaClient;
+use intus::tools::{Tool, ReadUrlTool};
+use intus::rag::RagSystem;
+use intus::ollama::OllamaClient;
 use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -73,7 +73,7 @@ async fn test_rag_end_to_end() {
     // We search for "content". Mock returns same embedding so it will match perfectly.
     // Since all chunks have same score (1.0), order might be strictly by insertion.
     // We request multiple results to find our target.
-    let search_results = rag.search("content", 5).await.expect("Search failed");
+    let search_results = rag.search("content", 5, None).await.expect("Search failed");
     
     assert!(!search_results.is_empty(), "Search should return results");
     let found = search_results.iter().any(|s| s.contains("Important content"));

@@ -1,11 +1,11 @@
-use ollama_tui::tools::{Tool, ReadUrlTool};
+use intus::tools::{Tool, ReadUrlTool};
 use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use std::sync::OnceLock;
 
-use ollama_tui::rag::RagSystem;
-use ollama_tui::ollama::OllamaClient;
+use intus::rag::RagSystem;
+use intus::ollama::OllamaClient;
 use std::sync::{Arc, Mutex};
 
 #[tokio::test]

@@ -1,4 +1,4 @@
-use ollama_tui::tools::{Tool, WebSearchTool};
+use intus::tools::{Tool, WebSearchTool};
 use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -25,8 +25,8 @@ async fn test_web_search_url_fetching() {
         let tool = WebSearchTool {
             searxng_url: "http://localhost:8080".to_string(),
             client: std::sync::OnceLock::new(),
-            rag: std::sync::Arc::new(ollama_tui::rag::RagSystem::new(
-                ollama_tui::ollama::OllamaClient::new("http://localhost".to_string()),
+            rag: std::sync::Arc::new(intus::rag::RagSystem::new(
+                intus::ollama::OllamaClient::new("http://localhost".to_string()),
                 "dummy".to_string(),
                 std::sync::Arc::new(std::sync::Mutex::new(None)),
                 None,

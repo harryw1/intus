@@ -1,4 +1,4 @@
-use ollama_tui::tools::{ReplaceTextTool, Tool, WriteFileTool};
+use intus::tools::{ReplaceTextTool, Tool, WriteFileTool};
 use serde_json::json;
 use std::fs;
 use tempfile::tempdir;
