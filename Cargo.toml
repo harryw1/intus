@@ -1,6 +1,6 @@
 [package]
 name = "intus"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 description = "A robust, privacy-first local AI assistant and system sidecar."
 authors = ["Harry Weiss"]
