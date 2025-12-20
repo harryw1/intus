@@ -1,3 +1,39 @@
+# Rust
 /target
 **/*.rs.bk
+
+# Debug
+*.pdb
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.bak
+
+# Environment
+.env
+.env.*
+
+# Logs
+*.log
+logs/
+
+# macOS
 .DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Linux
+*~
+
+# Testing artifacts
+*.profraw
