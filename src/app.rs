@@ -765,11 +765,11 @@ impl<'a> App<'a> {
             BaseDirs::new().map(|base| {
                 base.home_dir()
                     .join(".config")
-                    .join("tenere")
+                    .join("intus")
                     .join("sessions")
             })
         } else {
-            ProjectDirs::from("com", "tenere", "tenere")
+            ProjectDirs::from("com", "intus", "intus")
                 .map(|proj_dirs| proj_dirs.config_dir().join("sessions"))
         };
 

@@ -170,7 +170,7 @@ impl Config {
     /// If the file does not exist, default settings are returned.
     pub fn load() -> Result<Self> {
         let config_path = if cfg!(target_os = "macos") || cfg!(target_os = "linux") {
-            // Force ~/.config/tenere/config.toml for macOS and Linux
+            // Force ~/.config/intus/config.toml for macOS and Linux
             BaseDirs::new().map(|base| {
                 base.home_dir()
                     .join(".config")
