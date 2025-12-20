@@ -10,17 +10,10 @@ async fn test_persistence_lifecycle() {
     let file_path = dir.path().join("history.json");
 
     let (tx, _rx) = mpsc::unbounded_channel();
-    let config = Config {
-        ollama_url: "dummy".to_string(),
-        context_token_limit: 100,
-        system_prompt: "Sys".to_string(),
-        ignored_patterns: vec![],
-        auto_context: true,
-        summarization_enabled: true,
-        summarization_threshold: 0.8,
-        searxng_url: "http://localhost:8080".to_string(),
-        embedding_model: "nomic-embed-text".to_string(),
-    };
+    let mut config = Config::new_test_config();
+    config.ollama_url = "dummy".to_string();
+    config.context_token_limit = 100;
+    config.system_prompt = "Sys".to_string();
 
     // 2. User sends message
     let mut app = App::new(tx.clone(), config.clone(), true, Some(file_path.clone()));
@@ -29,6 +22,9 @@ async fn test_persistence_lifecycle() {
 
     app.update(Action::AddUserMessage("Hello Persistence".to_string()))
         .await;
+
+    // Wait for async save
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     // Verify file written
     let content = fs::read_to_string(&file_path).expect("File should exist");
@@ -47,6 +43,10 @@ async fn test_persistence_lifecycle() {
 
     // 4. Finish response
     app.update(Action::AiResponseComplete).await;
+
+    // Wait for async save
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
     let content_final = fs::read_to_string(&file_path).unwrap();
     assert!(content_final.contains("Thinking..."));
 
@@ -65,17 +65,10 @@ async fn test_prepare_quit_saves_session() {
     fs::create_dir_all(dir.path().join("sessions")).unwrap();
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let config = Config {
-        ollama_url: "dummy".to_string(),
-        context_token_limit: 100,
-        system_prompt: "Sys".to_string(),
-        ignored_patterns: vec![],
-        auto_context: true,
-        summarization_enabled: true,
-        summarization_threshold: 0.8,
-        searxng_url: "http://localhost:8080".to_string(),
-        embedding_model: "nomic-embed-text".to_string(),
-    };
+    let mut config = Config::new_test_config();
+    config.ollama_url = "dummy".to_string();
+    config.context_token_limit = 100;
+    config.system_prompt = "Sys".to_string();
 
     let mut app = App::new(tx.clone(), config.clone(), false, Some(file_path.clone()));
     app.models = vec!["test".to_string()];
@@ -89,6 +82,9 @@ async fn test_prepare_quit_saves_session() {
 
     // PrepareQuit should save and send Quit
     app.update(Action::PrepareQuit).await;
+
+    // Wait for async save
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     // Verify Quit action was sent
     let action = rx.recv().await.unwrap();
@@ -113,17 +109,10 @@ async fn test_atomic_write_creates_backup() {
     let file_path = sessions_dir.join("default.json");
 
     let (tx, _rx) = mpsc::unbounded_channel();
-    let config = Config {
-        ollama_url: "dummy".to_string(),
-        context_token_limit: 100,
-        system_prompt: "Sys".to_string(),
-        ignored_patterns: vec![],
-        auto_context: true,
-        summarization_enabled: true,
-        summarization_threshold: 0.8,
-        searxng_url: "http://localhost:8080".to_string(),
-        embedding_model: "nomic-embed-text".to_string(),
-    };
+    let mut config = Config::new_test_config();
+    config.ollama_url = "dummy".to_string();
+    config.context_token_limit = 100;
+    config.system_prompt = "Sys".to_string();
 
     // Create initial session with content
     let mut app = App::new(tx.clone(), config.clone(), false, Some(file_path.clone()));
@@ -132,10 +121,14 @@ async fn test_atomic_write_creates_backup() {
         .await;
 
     // Verify file exists
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert!(file_path.exists());
 
     // Add another message which should create backup of previous state
     app.update(Action::AiResponseComplete).await; // Complete response to trigger save
+
+    // Wait for backup creation
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     // Backup should exist after second save
     let backup_path = file_path.with_extension("json.bak");

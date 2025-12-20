@@ -1,7 +1,14 @@
 [package]
-name = "ollama-tui"
-version = "0.1.0"
+name = "tenere"
+version = "1.0.0"
 edition = "2021"
+description = "A robust, privacy-first local AI assistant and system sidecar."
+authors = ["Harry Weiss"]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/fiesty/tenere"
+keywords = ["ollama", "tui", "ai", "agent", "local"]
+categories = ["command-line-utilities", "text-processing"]
 
 [dependencies]
 ratatui = "0.29"
@@ -26,8 +33,16 @@ directories = "6.0.0"
 sysinfo = "0.32"
 arboard = "3.6.1"
 ignore = "0.4"
+chrono = "0.4.42"
 
 [dev-dependencies]
 wiremock = "0.6"
 tokio = { version = "1.0", features = ["full", "test-util"] }
 tempfile = "3.23.0"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = "z"  # Optimize for size, use "3" for speed if preferred. "z" is good for TUIs.

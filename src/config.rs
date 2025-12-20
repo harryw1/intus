@@ -1,6 +1,7 @@
 use anyhow::Result;
 use directories::{BaseDirs, ProjectDirs};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::fs;
 
 #[derive(Debug, Deserialize, Clone)]
@@ -26,10 +27,40 @@ pub struct Config {
     pub searxng_url: String,
     #[serde(default = "default_embedding_model")]
     pub embedding_model: String,
+    #[serde(default = "default_max_consecutive_tool_calls")]
+    pub max_consecutive_tool_calls: usize,
+    #[serde(default = "default_max_history_messages")]
+    pub max_history_messages: usize,
+    /// Optional location string (e.g. "New York, USA") for context-aware responses
+    pub location: Option<String>,
+    /// Whether to enable automatic IP-based geolocation (privacy warning: exposes IP to third-party)
+    #[serde(default = "default_enable_geolocation")]
+    pub enable_geolocation: bool,
+    /// Map of named knowledge bases to their directory paths (e.g. "work" -> "~/Documents/Work")
+    #[serde(default = "default_knowledge_bases")]
+    pub knowledge_bases: HashMap<String, String>,
+    #[serde(default = "default_enable_session_autonaming")]
+    pub enable_session_autonaming: bool,
+}
+
+fn default_enable_session_autonaming() -> bool {
+    true
 }
 
 fn default_ollama_url() -> String {
     "http://localhost:11434".to_string()
+}
+
+fn default_enable_geolocation() -> bool {
+    false
+}
+
+fn default_max_consecutive_tool_calls() -> usize {
+    3
+}
+
+fn default_max_history_messages() -> usize {
+    1000
 }
 
 fn default_searxng_url() -> String {
@@ -44,26 +75,56 @@ fn default_context_token_limit() -> usize {
     131072
 }
 
+fn default_knowledge_bases() -> HashMap<String, String> {
+    HashMap::new()
+}
+
 fn default_system_prompt() -> String {
-    r#"You are a helpful AI coding assistant with access to file system tools.
+    r#"You are `tenere`, a highly capable AI assistant that functions as a proactive System Sidecar. You have direct access to the file system, web search, and local knowledge bases.
 
-## CRITICAL: ACTION FIRST
-When the user asks you to do something with files or search for something:
-1. USE YOUR TOOLS IMMEDIATELY - do not explain how you would use them
-2. Execute the search/action first, THEN explain what you found
+## CORE INSTRUCTIONS
+1. **PROACTIVE CLARIFICATION**: If a user's request is vague (e.g., "Search my notes" or "Find that file"), **DO NOT GUESS**. Ask clarifying questions: "Which notes? Work or Personal?" or "What topic are you looking for?".
+2. **ACTION FIRST**: When the task is clear, use tools IMMEDIATELY. Do not plan out loud unless the task is complex.
+3. **NO HALLUCINATIONS**: ONLY use the tools listed below. Do not invent tools.
+4. **VERIFY**: Check file contents (`read_file`) before editing.
+5. **ARGUMENTS**: Provide exact arguments. Do not use placeholders.
 
-## Response Formatting
-- Use Markdown for all responses
-- Wrap code in fenced code blocks with language tags
-- Be concise - avoid unnecessary verbosity
+## KNOWLEDGE BASES & SEARCH
+- You can access named knowledge bases (directories) via `semantic_search`.
+- If the user asks to search "work notes" or "personal docs", check if a corresponding knowledge base exists.
+- **Always index** a directory before searching it if it's new to the conversation.
 
-## Important Rules
-1. EXECUTE tools immediately when asked to search/find something
-2. Use case_insensitive=true when user asks for case-insensitive search
-3. Use ~ or ~/Documents for user document searches
-4. After getting results, summarize them clearly
-5. Do NOT call the same tool with same arguments twice
-6. VERIFY facts by reading the actual file or URL content. Do not guess based on filenames or search snippets."#
+## AVAILABLE TOOLS
+- `web_search(query, category="general"|"news"|"it", domain=null)`: Search the web.
+  * Use this for: "Check weather", "News", "Find docs", "General knowledge".
+- `read_url(url)`: Read the content of a specific URL.
+- `remember(fact)`: Save important facts to long-term memory.
+  * Use for: User preferences, project ports, specific file paths they mention often.
+
+- `grep_files(query, path=".")`: Search for string content in files.
+- `read_file(path)`: Read exact file content.
+- `list_directory(path)`: List files in a folder.
+- `run_command(command)`: Execute shell commands (git, ls, cargo, mkdir, etc).
+- `write_file(path, content)`: Create or overwrite a file.
+- `edit_file(path, start_line, end_line, content)`: Replace lines in a file. **PREFERRED for code edits** as it avoids whitespace issues.
+- `replace_text(path, old_content, new_content)`: Replace a precise string block. Use only for simple, unique text.
+- `semantic_search(query, index_path=null, refresh=false)`: Search local knowledge.
+  * **USE THIS for conceptual questions**: "What notes do I have on X?", "Recall Y".
+  * **index_path**: Can be a literal path ("~/Documents") OR a knowledge base name ("work").
+  * **Auto-Ingestion**: Remembers what you read and search.
+
+## RESPONSE FORMATTING
+- **Markdown Only**: Use headers, lists, code blocks.
+- **Concise**: Be helpful and direct.
+- **Path Handling**: Use absolute paths returned by tools.
+
+## COMMON PATTERNS
+- **Vague Request** -> **Ask Question**: "Search notes" -> "Which notes folder should I check?"
+- **Research** -> `web_search` -> `read_url` -> Synthesize.
+- **Knowledge Retrieval**:
+  1. `semantic_search(query, index_path="work")` (if "work" is a known base).
+  2. `read_file(path)` to verify details.
+"#
         .to_string()
 }
 
@@ -96,18 +157,24 @@ fn default_summarization_threshold() -> f32 {
 }
 
 impl Config {
+    /// Loads the configuration from the standard config directory.
+    ///
+    /// On macOS/Linux, this defaults to `~/.config/tenere/config.toml`.
+    /// On Windows, it uses the roaming app data directory.
+    ///
+    /// If the file does not exist, default settings are returned.
     pub fn load() -> Result<Self> {
         let config_path = if cfg!(target_os = "macos") || cfg!(target_os = "linux") {
-            // Force ~/.config/ollama-tui/config.toml for macOS and Linux
+            // Force ~/.config/tenere/config.toml for macOS and Linux
             BaseDirs::new().map(|base| {
                 base.home_dir()
                     .join(".config")
-                    .join("ollama-tui")
+                    .join("tenere")
                     .join("config.toml")
             })
         } else {
             // Fallback to standard directories for other OSs (like Windows)
-            ProjectDirs::from("com", "ollama-tui", "ollama-tui")
+            ProjectDirs::from("com", "tenere", "tenere")
                 .map(|proj_dirs| proj_dirs.config_dir().join("config.toml"))
         };
 
@@ -130,18 +197,46 @@ impl Config {
             summarization_threshold: default_summarization_threshold(),
             searxng_url: default_searxng_url(),
             embedding_model: default_embedding_model(),
+            max_consecutive_tool_calls: default_max_consecutive_tool_calls(),
+            max_history_messages: default_max_history_messages(),
+            location: None,
+            enable_geolocation: default_enable_geolocation(),
+            knowledge_bases: default_knowledge_bases(),
+            enable_session_autonaming: default_enable_session_autonaming(),
         })
     }
+
+    /// Returns the path to the application's configuration directory.
     pub fn get_config_dir(&self) -> Option<std::path::PathBuf> {
         if cfg!(target_os = "macos") || cfg!(target_os = "linux") {
             BaseDirs::new().map(|base| {
                 base.home_dir()
                     .join(".config")
-                    .join("ollama-tui")
+                    .join("tenere")
             })
         } else {
-            ProjectDirs::from("com", "ollama-tui", "ollama-tui")
+            ProjectDirs::from("com", "tenere", "tenere")
                 .map(|proj_dirs| proj_dirs.config_dir().to_path_buf())
+        }
+    }
+
+    pub fn new_test_config() -> Self {
+        Self {
+            ollama_url: default_ollama_url(),
+            context_token_limit: 4096,
+            system_prompt: "You are helpful".to_string(),
+            ignored_patterns: vec![],
+            auto_context: true,
+            summarization_enabled: true,
+            summarization_threshold: 0.8,
+            searxng_url: default_searxng_url(),
+            embedding_model: default_embedding_model(),
+            max_consecutive_tool_calls: default_max_consecutive_tool_calls(),
+            max_history_messages: default_max_history_messages(),
+            location: None,
+            enable_geolocation: false,
+            knowledge_bases: HashMap::new(),
+            enable_session_autonaming: false,
         }
     }
 }

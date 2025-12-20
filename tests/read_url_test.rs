@@ -1,10 +1,15 @@
-use ollama_tui::tools::{Tool, WebSearchTool};
+use ollama_tui::tools::{Tool, ReadUrlTool};
 use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+use std::sync::OnceLock;
+
+use ollama_tui::rag::RagSystem;
+use ollama_tui::ollama::OllamaClient;
+use std::sync::{Arc, Mutex};
 
 #[tokio::test]
-async fn test_web_search_url_fetching() {
+async fn test_read_url_fetching() {
     // Start a mock server
     let mock_server = MockServer::start().await;
 
@@ -19,18 +24,19 @@ async fn test_web_search_url_fetching() {
     let url = format!("{}/test-page", server_uri);
 
     // Initial dummy tool
-    // We wrap execution in spawn_blocking because WebSearchTool uses reqwest::blocking
+    // We wrap execution in spawn_blocking because ReadUrlTool uses reqwest::blocking
     // and we are in an async runtime.
     let result = tokio::task::spawn_blocking(move || {
-        let tool = WebSearchTool {
-            searxng_url: "http://localhost:8080".to_string(),
-            client: std::sync::OnceLock::new(),
-            rag: std::sync::Arc::new(ollama_tui::rag::RagSystem::new(
-                ollama_tui::ollama::OllamaClient::new("http://localhost".to_string()),
-                "dummy".to_string(),
-                std::sync::Arc::new(std::sync::Mutex::new(None)),
-                None,
-            )),
+        let rag = Arc::new(RagSystem::new(
+            OllamaClient::new("http://localhost".to_string()),
+            "dummy_model".to_string(),
+            Arc::new(Mutex::new(None)),
+            None
+        ));
+
+        let tool = ReadUrlTool {
+            client: OnceLock::new(),
+            rag,
         };
 
         let args = json!({

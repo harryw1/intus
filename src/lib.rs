@@ -7,3 +7,5 @@ pub mod tools;
 pub mod ui;
 pub mod theme;
 pub mod rag;
+pub mod persistence;
+pub mod logging;

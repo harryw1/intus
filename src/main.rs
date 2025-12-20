@@ -1,3 +1,8 @@
+//! # Ollama TUI Application Entry Point
+//!
+//! This file contains the `main` function which sets up the application environment,
+//! initializes the TUI backend, loads configuration, and starts the main event loop.
+
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseEventKind},
     execute,
@@ -10,15 +15,29 @@ use ratatui::{
 use std::io;
 use tokio::sync::mpsc;
 
-use ollama_tui::app::{Action, App};
-use ollama_tui::config::Config;
-use ollama_tui::ui::ui;
- // For debug logging
-use std::io::Write; // For debug logging & flush
+use tenere::app::{Action, App};
+use tenere::config::Config;
+use tenere::ui::ui;
+use tenere::logging;
+use tracing::{info, warn};
+use std::io::Write;
 
+/// The main entry point for the Ollama TUI application.
+///
+/// This function:
+/// 1. Initializes logging.
+/// 2. Sets up the terminal in raw mode with mouse support.
+/// 3. Loads the application configuration.
+/// 4. Spawns a background task for handling input events.
+/// 5. Runs the main application loop.
+/// 6. Cleans up the terminal state upon exit.
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Setup terminal
+    // Initialize logging
+    let _ = logging::init_logging();
+    info!("Starting Tenere");
+
+    // Load config
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -30,21 +49,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Load configuration
     let config = Config::load().unwrap_or_else(|e| {
-        eprintln!(
-            "Warning: Failed to load config, using defaults. Error: {}",
-            e
-        );
-        Config {
-            ollama_url: "http://localhost:11434".to_string(),
-            context_token_limit: 4096,
-            system_prompt: "You are a helpful AI assistant with access to local system tools. You can read/write files and run commands. Use these tools whenever real-world interaction is needed.".to_string(),
-            ignored_patterns: vec![],
-            auto_context: true,
-            summarization_enabled: true,
-            summarization_threshold: 0.8,
-            searxng_url: "http://localhost:8080".to_string(),
-            embedding_model: "nomic-embed-text".to_string(),
-        }
+        warn!("Failed to load config, using defaults. Error: {}", e);
+        Config::new_test_config()
     });
 
     let mut app = App::new(action_tx.clone(), config, true, None);
@@ -100,6 +106,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Kill any lingering child processes spawned by tools
     app.process_tracker.kill_all();
+
+    // Ensure session is saved
+    app.wait_for_save().await;
 
     // Ensure terminal buffer is flushed before exit
     let _ = std::io::stdout().flush();

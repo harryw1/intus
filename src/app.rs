@@ -2,7 +2,8 @@ use crate::config::Config;
 use crate::process::ProcessTracker;
 use crate::context::ContextManager;
 use crate::ollama::{ChatMessage, ChatMessageRequest, ChatStreamEvent, OllamaClient, ToolCall};
-use crate::tools::{CatTool, FileSearchTool, GrepTool, ListDirectoryTool, ReplaceTextTool, RunCommandTool, SemanticSearchTool, Tool, WebSearchTool, WriteFileTool};
+use crate::tools::{CatTool, GrepTool, ListDirectoryTool, ReadUrlTool, ReplaceTextTool, EditFileTool, RunCommandTool, SemanticSearchTool, Tool, WebSearchTool, WriteFileTool, MemoryTool};
+use crate::persistence::SessionManager;
 use crossterm::event::{KeyCode, KeyModifiers};
 use directories::{BaseDirs, ProjectDirs};
 use futures::StreamExt;
@@ -19,7 +20,14 @@ use tui_textarea::{Input, TextArea};
 use arboard::Clipboard;
 
 /// Generates system context information for the LLM to understand the user's environment.
-fn get_system_context() -> String {
+///
+/// This includes:
+/// - Current Date and Time
+/// - Operating System
+/// - Home Directory
+/// - Current Working Directory
+/// - User Location (if available)
+fn get_system_context(location: Option<&str>) -> String {
     let os = if cfg!(target_os = "macos") {
         "macOS"
     } else if cfg!(target_os = "linux") {
@@ -38,130 +46,260 @@ fn get_system_context() -> String {
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
 
+    let now = chrono::Local::now();
+    let date_str = now.format("%A, %B %d, %Y").to_string();
+    let time_str = now.format("%I:%M %p").to_string();
+    let timezone = now.format("%Z").to_string();
+
+    let location_str = location
+        .map(|l| format!("Location: {}\n", l))
+        .unwrap_or_default();
+
     format!(
-        "\n\n[System Info]\nOS: {}\nHome Directory: {}\nCurrent Working Directory: {}\n\nWhen using file system tools, use these actual paths instead of guessing. For example, use '{}' instead of '/home/user'.",
-        os, home_dir, cwd, home_dir
+        "\n\n[System Context]\nDate: {}\nTime: {} ({})\n{}OS: {}\nHome Directory: {}\nCurrent Working Directory: {}\n\nWhen using file system tools, use these actual paths instead of guessing. For example, use '{}' instead of '/home/user'.",
+        date_str, time_str, timezone, location_str, os, home_dir, cwd, home_dir
     )
 }
 
+/// Represents all possible actions that can occur in the application.
+/// These actions are handled by the `update` loop to modify the state.
 #[derive(Debug, PartialEq, Clone)]
 pub enum Action {
+    /// Renders the UI.
     Render,
     #[allow(dead_code)]
+    /// Resizes the terminal.
     Resize(u16, u16),
+    /// Quits the application.
     Quit,
+    /// Represents an error message to be displayed.
     Error(String),
+    /// Represents a key press or mouse event from the user.
     UserInput(crossterm::event::KeyEvent),
+    /// Triggers the loading of available models.
     LoadModels,
+    /// Indicates that models have been successfully loaded.
     ModelsLoaded(Vec<String>),
+    /// Enters the model selection mode.
     EnterModelSelect,
+    /// Sends the current user input as a message to the AI.
     SendMessage,
+    /// Adds a user message to the history explicitly.
     AddUserMessage(String),
+    /// Adds a stream token from the AI response.
     AddAiToken(String),
+    /// Adds a tool call request from the AI.
     AddToolCall(ToolCall),
+    /// Adds the output of a tool execution.
     AddToolOutput(String, String), // name, output
+    /// Requests the AI to generate a response.
     RequestAiResponse,
+    /// Indicates that the AI response generation is complete.
     AiResponseComplete,
+    /// Switches the input mode.
     SwitchMode(Mode),
+    /// Clears the conversation history.
     ClearHistory,
+    /// Updates the system prompt with new text.
     UpdateSystemPrompt(String),
+    /// Enters the mode to edit the system prompt.
     EnterSystemPromptEdit,
+    /// Scrolls the message view.
     Scroll(i16),
     // Session Actions
+    /// Opens the session selection menu.
     EnterSessionSelect,
+    /// Selects a specific session to load.
     SelectSession(String),
+    /// Opens the session creation input.
     EnterSessionCreate,
+    /// Creates a new session with the given name.
     CreateSession(String),
+    /// Deletes a session.
     DeleteSession(String),
+    /// Indicates that sessions have been loaded (unused currently).
     SessionsLoaded(Vec<String>),
     // Model Management Actions
+    /// Enters the model pulling interface.
     EnterModelPull,
+    /// Starts pulling a model from Ollama.
     StartPullModel(String),
+    /// Updates progress for a model pull operation.
     PullProgress(String, Option<u64>, Option<u64>), // Status, Completed, Total
+    /// Deletes a local model.
     DeleteModel(String),
+    /// Prepares the application to quit (e.g., saving state).
     PrepareQuit,
+    /// Confirms a pending tool execution.
     ConfirmToolExecution,
+    /// Denies a pending tool execution.
     DenyToolExecution,
+    /// Cancels the current AI generation.
     CancelGeneration,
+    /// Copies the selected message to clipboard.
     CopyMessage,
+    /// Moves the message selection cursor.
     MoveSelection(i16),
     // Context Management
+    /// Updates the context token limit for the current model.
     UpdateModelContextLimit(usize),
+    /// Indicates that a conversation summary is ready.
     SummaryReady(String, usize), // summary text, count of messages summarized
+    // RAG
+    /// Indicates that RAG context has been retrieved.
+    RagContextReady(Option<String>),
+    // Geolocation
+    GeolocationReady(String),
+    // Status
+    ShowStatus(String),
+    // Session Auto-Naming
+    TriggerAutoNaming,
+    RenameSession(String),
 }
 
+/// Defines the current input mode of the application.
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum Mode {
+    /// Standard input mode for typing messages.
     Insert,
+    /// Navigation mode (e.g., for scrolling or selecting messages).
     Normal,
+    /// Mode for selecting an AI model.
     ModelSelect,
+    /// Mode for editing the system prompt.
     SystemPromptEdit,
+    /// Mode for selecting a saved session.
     SessionSelect,
+    /// Mode for creating a new session.
     SessionCreate,
+    /// Mode for entering a model name to pull.
     ModelPullInput,
+    /// Mode for confirming a tool execution.
     ToolConfirmation,
 }
 
+/// The main application state struct.
+///
+/// Holds all data required to render the TUI and manage the application logic,
+/// including chat history, configuration, tools, and background processes.
 pub struct App<'a> {
+    /// Client for interacting with the Ollama API.
     pub ollama_client: OllamaClient,
+    /// Channel for sending actions to the main loop.
     pub action_tx: mpsc::UnboundedSender<Action>,
+    /// List of chat messages in the current conversation.
     pub messages: Vec<ChatMessage>,
+    /// Text area for user input.
     pub input: TextArea<'a>, // Using tui-textarea
+    /// List of available AI models.
     pub models: Vec<String>,
+    /// Index of the currently selected model.
     pub selected_model: usize,
+    /// Vertical scroll offset for the chat view.
     pub vertical_scroll: u16,
+    /// Whether to auto-scroll to the bottom of the chat.
     pub auto_scroll: bool,
+    /// Current input mode.
     pub mode: Mode,
+    /// Whether the application is currently loading (e.g., waiting for AI response).
     pub loading: bool,
+    /// Current error message, if any.
     pub error: Option<String>,
+    /// Buffer for building the current AI response.
     pub current_response_buffer: String,
+    /// Whether to show the help overlay.
     pub show_help: bool,
+    /// State for the loading spinner.
     pub spinner_state: ThrobberState,
+    /// Configured global context token limit.
     pub context_token_limit: usize,
+    /// The current system prompt.
     pub system_prompt: String,
+    /// Input area for editing the system prompt.
     pub system_prompt_input: TextArea<'a>,
+    /// Path to a custom session file, if provided.
     pub session_file_path: Option<PathBuf>,
     // Session state
+    /// Name of the current session.
     pub current_session: String,
+    /// List of available saved sessions.
     pub available_sessions: Vec<String>,
+    /// State for the session list widget.
     pub session_list_state: ratatui::widgets::ListState,
+    /// Input area for creating new sessions.
     pub session_input: TextArea<'a>,
     // Model Management state
+    /// Input area for pulling models.
     pub pull_input: TextArea<'a>,
+    /// Progress of the current model pull operation.
     pub pull_progress: Option<(String, Option<u64>, Option<u64>)>,
     // Tools
+    /// Registry of available tools.
     pub tools: HashMap<String, Arc<dyn Tool>>,
-    /// Counter for consecutive tool calls to prevent infinite loops
+    /// Counter for consecutive tool calls to prevent infinite loops.
     consecutive_tool_calls: usize,
-    /// Pending tool call waiting for user confirmation
+    /// Pending tool call waiting for user confirmation.
     pub pending_tool_call: Option<ToolCall>,
+    /// Whether a tool is currently executing (for UI feedback).
+    pub is_tool_executing: bool,
     // Persistence
     last_save_time: std::time::Instant,
     // Context Management
+    /// Manager for handling context window optimization.
     pub context_manager: ContextManager,
+    /// Current estimated token usage.
     pub current_token_usage: usize,
+    /// Scroll offset for the tool confirmation view.
     pub tool_scroll: u16,
+    /// Specific context limit for the currently loaded model.
     pub model_context_limit: Option<usize>,
+    /// Summary of the conversation history.
     pub conversation_summary: Option<String>,
+    /// Number of messages included in the summary.
     pub summarized_count: usize,
+    /// Whether summarization is currently in progress.
     pub is_summarizing: bool,
     // Stop Generation
+    /// Handle to abort the current AI request.
     pub current_request_handle: Option<AbortHandle>,
     // Clipboard & Selection
+    /// Index of the currently selected message (for copying/viewing).
     pub selected_message_index: Option<usize>,
     #[allow(dead_code)] // Keep it alive
     pub clipboard: Option<Clipboard>,
     // UX
+    /// Temporary notification message.
     pub notification: Option<(String, std::time::Instant)>,
+    /// Current UI theme.
     pub theme: crate::theme::Theme,
+    /// Tracker for child processes spawned by tools.
     pub process_tracker: Arc<ProcessTracker>,
+    /// System for Retrieval-Augmented Generation.
     pub rag: crate::rag::RagSystem,
+    /// Shared in-memory vector index.
+    pub vector_index: Arc<std::sync::Mutex<Option<crate::tools::VectorIndex>>>,
+    // Async Persistence
+    /// Manager for asynchronous session saving.
+    pub session_manager: SessionManager,
+    // Limits
+    /// Maximum allowed consecutive tool calls.
+    pub max_consecutive_tool_calls: usize,
+    /// Maximum number of messages to keep in history.
+    pub max_history_messages: usize,
+    /// Detected or configured user location.
+    pub location: Option<String>,
+    pub enable_session_autonaming: bool,
 }
 
-/// Maximum number of consecutive tool calls before forcing a text response
-const MAX_CONSECUTIVE_TOOL_CALLS: usize = 3;
-
 impl<'a> App<'a> {
+    /// Creates a new instance of the application.
+    ///
+    /// # Arguments
+    ///
+    /// * `action_tx` - Channel sender for dispatching actions to the main loop.
+    /// * `config` - Application configuration.
+    /// * `load_history` - Whether to load the previous session history on startup.
+    /// * `custom_session_path` - Optional path to a specific session file to load.
     pub fn new(
         action_tx: mpsc::UnboundedSender<Action>,
         config: Config,
@@ -177,13 +315,33 @@ impl<'a> App<'a> {
 
         let process_tracker = Arc::new(ProcessTracker::new());
 
+        let storage_path = config.get_config_dir().map(|d| d.join("memory").join("vectors.json"));
+        // Ensure memory dir exists
+        if let Some(path) = &storage_path {
+            if let Some(parent) = path.parent() {
+                 let _ = std::fs::create_dir_all(parent);
+            }
+        }
+        
+        let vector_index = Arc::new(std::sync::Mutex::new(None));
+
+        let shared_rag = Arc::new(crate::rag::RagSystem::new(
+            OllamaClient::new(config.ollama_url.clone()),
+            config.embedding_model.clone(),
+            vector_index.clone(),
+            storage_path.clone(),
+        ));
+
         let mut tools: HashMap<String, Arc<dyn Tool>> = HashMap::new();
-        tools.insert(
-            "find_files".to_string(),
-            Arc::new(FileSearchTool {
-                ignored_patterns: config.ignored_patterns.clone(),
-            }),
-        );
+
+        let (status_tx, mut status_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let action_tx_clone = action_tx.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = status_rx.recv().await {
+                 let _ = action_tx_clone.send(Action::ShowStatus(msg));
+            }
+        });
+
         tools.insert(
             "grep_files".to_string(),
             Arc::new(GrepTool {
@@ -194,6 +352,7 @@ impl<'a> App<'a> {
             "read_file".to_string(),
             Arc::new(CatTool {
                 ignored_patterns: config.ignored_patterns.clone(),
+                rag: shared_rag.clone(),
             }),
         );
         tools.insert(
@@ -209,21 +368,25 @@ impl<'a> App<'a> {
             }),
         );
         tools.insert(
+            "edit_file".to_string(),
+            Arc::new(EditFileTool {
+                ignored_patterns: config.ignored_patterns.clone(),
+            }),
+        );
+        tools.insert(
             "replace_text".to_string(),
             Arc::new(ReplaceTextTool {
                 ignored_patterns: config.ignored_patterns.clone(),
             }),
         );
-        let storage_path = config.get_config_dir().map(|d| d.join("vectors.json"));
-        
+
         tools.insert(
             "semantic_search".to_string(),
             Arc::new(SemanticSearchTool {
-                client: OllamaClient::new(config.ollama_url.clone()),
-                index: Arc::new(std::sync::Mutex::new(None)),
-                embedding_model: config.embedding_model.clone(),
+                rag: shared_rag.clone(),
                 ignored_patterns: config.ignored_patterns.clone(),
-                storage_path,
+                knowledge_bases: config.knowledge_bases.clone(),
+                status_tx: Some(status_tx),
             }),
         );
         tools.insert(
@@ -231,6 +394,21 @@ impl<'a> App<'a> {
             Arc::new(WebSearchTool {
                 searxng_url: config.searxng_url.clone(),
                 client: std::sync::OnceLock::new(),
+                rag: shared_rag.clone(),
+            }),
+        );
+        tools.insert(
+            "read_url".to_string(),
+            Arc::new(ReadUrlTool {
+                client: std::sync::OnceLock::new(),
+                rag: shared_rag.clone(),
+            }),
+        );
+
+        tools.insert(
+            "remember".to_string(),
+            Arc::new(MemoryTool {
+                rag: shared_rag.clone(),
             }),
         );
         tools.insert(
@@ -257,6 +435,17 @@ impl<'a> App<'a> {
             }),
         );
 
+        // Spawn Session Saver Task - REPLACED by SessionManager
+        let session_manager = SessionManager::new();
+
+        let mut system_prompt = config.system_prompt.clone();
+        if !config.knowledge_bases.is_empty() {
+            system_prompt.push_str("\n\n## CONFIGURED KNOWLEDGE BASES\n");
+            for (name, path) in &config.knowledge_bases {
+                system_prompt.push_str(&format!("- **{}**: {}\n", name, path));
+            }
+        }
+
         let mut app = Self {
             ollama_client: OllamaClient::new(config.ollama_url.clone()),
             action_tx,
@@ -273,8 +462,8 @@ impl<'a> App<'a> {
             show_help: false,
             spinner_state: ThrobberState::default(),
             context_token_limit: config.context_token_limit,
-            system_prompt: config.system_prompt.clone(),
-            system_prompt_input: TextArea::new(vec![config.system_prompt]),
+            system_prompt: system_prompt.clone(),
+            system_prompt_input: TextArea::new(vec![system_prompt]),
             session_file_path: custom_session_path,
             current_session: "default".to_string(),
             available_sessions: Vec::new(),
@@ -285,6 +474,7 @@ impl<'a> App<'a> {
             tools,
             consecutive_tool_calls: 0,
             pending_tool_call: None,
+            is_tool_executing: false,
             last_save_time: std::time::Instant::now(),
             context_manager: ContextManager::new(
                 config.auto_context,
@@ -306,7 +496,15 @@ impl<'a> App<'a> {
             rag: crate::rag::RagSystem::new(
                 OllamaClient::new(config.ollama_url.clone()),
                 config.embedding_model.clone(),
+                vector_index.clone(),
+                storage_path,
             ),
+            vector_index,
+            session_manager,
+            max_consecutive_tool_calls: config.max_consecutive_tool_calls,
+            max_history_messages: config.max_history_messages,
+            location: config.location.clone(),
+            enable_session_autonaming: config.enable_session_autonaming,
         };
 
         if load_history {
@@ -314,6 +512,37 @@ impl<'a> App<'a> {
             app.migrate_legacy_history();
             app.load_session("default");
         }
+
+        // Trigger Geolocation if enabled and not manually set
+        if config.enable_geolocation && config.location.is_none() {
+            let tx = app.action_tx.clone();
+            tokio::spawn(async move {
+                #[derive(serde::Deserialize)]
+                struct IpApiLocation {
+                    city: String,
+                    #[serde(rename = "regionName")]
+                    region_name: String,
+                    country: String,
+                }
+                
+                // Use ip-api.com (free, no key required for low volume)
+                // Note: user must opt-in via config
+                let url = "http://ip-api.com/json/?fields=city,regionName,country";
+                
+                match reqwest::get(url).await {
+                    Ok(resp) => {
+                        if let Ok(loc) = resp.json::<IpApiLocation>().await {
+                            let loc_str = format!("{}, {}, {}", loc.city, loc.region_name, loc.country);
+                            let _ = tx.send(Action::GeolocationReady(loc_str));
+                        }
+                    }
+                    Err(_) => {
+                        // Silently fail or log? For now silent as it's optional enhancement
+                    }
+                }
+            });
+        }
+
         app
     }
 
@@ -326,7 +555,7 @@ impl<'a> App<'a> {
     /// Calculates the token usage of the *actual* context window we would send.
     fn calculate_context_usage(&self) -> usize {
         let _limit = self.model_context_limit.unwrap_or(self.context_token_limit);
-        let system_prompt_tokens = self.estimate_tokens(&self.system_prompt) + self.estimate_tokens(&get_system_context());
+        let system_prompt_tokens = self.estimate_tokens(&self.system_prompt) + self.estimate_tokens(&get_system_context(self.location.as_deref()));
         
         let summary_tokens = if let Some(summary) = &self.conversation_summary {
              self.estimate_tokens(summary) + 10 
@@ -431,7 +660,7 @@ impl<'a> App<'a> {
         let limit = self.model_context_limit.unwrap_or(self.context_token_limit);
         
         // Calculate reserved tokens (System Prompt + potential Summary)
-        let system_prompt_tokens = self.estimate_tokens(&self.system_prompt) + self.estimate_tokens(&get_system_context());
+        let system_prompt_tokens = self.estimate_tokens(&self.system_prompt) + self.estimate_tokens(&get_system_context(self.location.as_deref()));
         let summary_tokens = if let Some(summary) = &self.conversation_summary {
              self.estimate_tokens(summary) + 10 // +10 overhead
         } else {
@@ -500,7 +729,7 @@ impl<'a> App<'a> {
         }
 
         // Prepend system prompt with system context
-        let full_system_prompt = format!("{}{}", self.system_prompt, get_system_context());
+        let full_system_prompt = format!("{}{}", self.system_prompt, get_system_context(self.location.as_deref()));
         context_messages.insert(
             0,
             ChatMessageRequest {
@@ -520,11 +749,11 @@ impl<'a> App<'a> {
             BaseDirs::new().map(|base| {
                 base.home_dir()
                     .join(".config")
-                    .join("ollama-tui")
+                    .join("tenere")
                     .join("sessions")
             })
         } else {
-            ProjectDirs::from("com", "ollama-tui", "ollama-tui")
+            ProjectDirs::from("com", "tenere", "tenere")
                 .map(|proj_dirs| proj_dirs.config_dir().join("sessions"))
         };
 
@@ -546,12 +775,22 @@ impl<'a> App<'a> {
     }
 
     fn migrate_legacy_history(&self) {
-        if let Some(proj_dirs) = ProjectDirs::from("com", "ollama-tui", "ollama-tui") {
-            let config_dir = proj_dirs.config_dir();
+        // Check for old ollama-tui history
+        let old_config_dir = if cfg!(target_os = "macos") || cfg!(target_os = "linux") {
+             BaseDirs::new().map(|base| base.home_dir().join(".config").join("ollama-tui"))
+        } else {
+             ProjectDirs::from("com", "ollama-tui", "ollama-tui").map(|p| p.config_dir().to_path_buf())
+        };
+
+        if let Some(config_dir) = old_config_dir {
             let legacy_path = config_dir.join("history.json");
             if legacy_path.exists() {
                 if let Some(default_path) = self.get_session_path("default") {
                     if !default_path.exists() {
+                        // Ensure parent dir exists
+                        if let Some(parent) = default_path.parent() {
+                            let _ = fs::create_dir_all(parent);
+                        }
                         let _ = fs::rename(legacy_path, default_path);
                     }
                 }
@@ -587,19 +826,13 @@ impl<'a> App<'a> {
 
     fn save_session(&self) {
         if let Some(path) = self.get_session_path(&self.current_session) {
-            if let Ok(json) = serde_json::to_string(&self.messages) {
-                // Create backup of existing session before overwriting
-                if path.exists() {
-                    let backup_path = path.with_extension("json.bak");
-                    let _ = fs::copy(&path, &backup_path);
-                }
-                // Atomic write: write to temp file, then rename
-                let temp_path = path.with_extension("json.tmp");
-                if fs::write(&temp_path, &json).is_ok() {
-                    let _ = fs::rename(&temp_path, &path);
-                }
-            }
+            let messages_clone = self.messages.clone();
+            self.session_manager.save_session(path, messages_clone);
         }
+    }
+    
+    pub async fn wait_for_save(&self) {
+        self.session_manager.wait_for_save().await;
     }
 
     /// Throttled save - at most once every 2 seconds during streaming.
@@ -665,55 +898,53 @@ impl<'a> App<'a> {
             self.current_response_buffer.clear();
         }
 
-        // 1. Get the last USER message (ignoring the empty assistant placeholder we just pushed)
-        // We look for the last actual content message from the user.
+        // 1. Get the last USER message
         let last_user_content = self.messages.iter()
             .rev()
             .skip(1) // skip the empty assistant message
             .find(|m| m.role == "user")
             .map(|m| m.content.clone());
 
-        // 2. Perform RAG Search if valid user query
-        let cloned_rag = if let Some(query) = last_user_content {
-             // We can't use self.rag directly in the async block easily due to borrow checker
-             // But actually we need the result BEFORE we build context window?
-             // Or we inject it into the message list temporarily?
-             // Let's search synchronously here (blocking the UI briefly is acceptable for now, or we spawn?)
-             // RAG search relies on network (Ollama embedding). We should async it.
-             // BUT `build_context_window` is synchronous.
-             // We need to fetch context, modify the message history (or context window), THEN run chat.
-             // Let's do it inside a separate spawn? No, that complicates state.
-             
-             // Simplest First Implementation:
-             // Block on RAG search. (freeze UI for 100ms-500ms).
-             // Since we are inside `request_ai_response` which is async, we can await!
-             // `request_ai_response` is `async fn`.
-             
-             if let Ok(results) = self.rag.search(&query, 3).await {
-                 if !results.is_empty() {
-                      // Format context
-                      let context_block = format!("\n\n[Relevant Context from Tools]:\n{}", results.join("\n---\n"));
-                      // Inject into the SYSTEM prompt for this turn? Or as a System Message?
-                      // Let's append to the last user message in the CONTEXT ONLY?
-                      // `build_context_window` reads `self.messages`.
-                      // We don't want to modify `self.messages` permanently with this context (it's confusing in UI).
-                      // So we should modify `context_messages` AFTER calling `build_context_window`.
-                      Some(context_block)
-                 } else {
-                     None
-                 }
-             } else {
-                 None
-             }
+        // 2. Perform Async RAG Search
+        if let Some(query) = last_user_content {
+            let rag_arc = Arc::new(self.rag.clone()); // Need to clone the RagSystem? It has Arc internals, but RagSystem itself isn't Arc.
+            // RagSystem fields are Arc. `client` is not Arc but is cloneable (Reqwest client is Arc internally).
+            // So cloning RagSystem is cheap.
+            let query_clone = query.clone();
+            let tx = self.action_tx.clone();
+            
+            // We spawn the search. The generation will start when RagContextReady is received.
+            tokio::spawn(async move {
+                // Limit search to 3 results
+                // Search all collections (None) for general chat context
+                match rag_arc.search(&query_clone, 3, None).await {
+                    Ok(results) => {
+                         if !results.is_empty() {
+                             let context = format!("\n\n[Relevant Context from Tools]:\n{}", results.join("\n---\n"));
+                             let _ = tx.send(Action::RagContextReady(Some(context)));
+                         } else {
+                             let _ = tx.send(Action::RagContextReady(None));
+                         }
+                    }
+                    Err(_) => {
+                        // Ignore error, proceed without context
+                        let _ = tx.send(Action::RagContextReady(None));
+                    }
+                }
+            });
         } else {
-            None
-        };
-        
+            // No user message (?), just start generation
+            self.start_generation(None).await;
+        }
+    }
+
+    async fn start_generation(&mut self, rag_context: Option<String>) {
         let mut context_messages = self.build_context_window();
         
         // Inject RAG context if available
-        if let Some(ctx) = cloned_rag {
+        if let Some(ctx) = rag_context {
              // Find the last user message in context_messages and append context
+             // Note: context_messages is a fresh Vec created by build_context_window
              if let Some(msg) = context_messages.iter_mut().rfind(|m| m.role == "user") {
                   msg.content.push_str(&ctx);
              }
@@ -724,9 +955,8 @@ impl<'a> App<'a> {
         let tx = self.action_tx.clone();
 
         // Disable tools if we've hit the consecutive tool call limit
-        // This forces the model to generate a text response
         let tool_definitions =
-            if !self.tools.is_empty() && self.consecutive_tool_calls < MAX_CONSECUTIVE_TOOL_CALLS {
+            if !self.tools.is_empty() && self.consecutive_tool_calls < self.max_consecutive_tool_calls {
                 Some(self.tools.values().map(|t| t.definition()).collect())
             } else {
                 None
@@ -772,127 +1002,8 @@ impl<'a> App<'a> {
         self.auto_scroll = true;
     }
 
-    pub async fn update(&mut self, action: Action) -> bool {
+    async fn update_chat(&mut self, action: Action) -> bool {
         match action {
-            Action::Error(e) => {
-                self.error = Some(e);
-                self.loading = false;
-                true
-            }
-            Action::LoadModels => {
-                self.loading = true;
-                let client = self.ollama_client.clone();
-                let tx = self.action_tx.clone();
-                tokio::spawn(async move {
-                    match client.list_models().await {
-                        Ok(models) => {
-                            let _ = tx.send(Action::ModelsLoaded(models));
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Action::Error(e.to_string()));
-                        }
-                    }
-                });
-                true
-            }
-            Action::ModelsLoaded(models) => {
-                self.loading = false;
-                self.models = models;
-                if !self.models.is_empty() {
-                    self.selected_model = 0;
-                    // Trigger fetching context limit for the default selected model
-                    let model_name = self.models[0].clone();
-                    let client = self.ollama_client.clone();
-                    let tx = self.action_tx.clone();
-                    tokio::spawn(async move {
-                        if let Ok(info) = client.show_model(&model_name).await {
-                            if let Some(limit) = info.context_length() {
-                                let _ = tx.send(Action::UpdateModelContextLimit(limit));
-                            }
-                        }
-                    });
-                }
-                true
-            }
-            Action::UpdateModelContextLimit(limit) => {
-                self.model_context_limit = Some(limit);
-                // Re-calculate token usage with new limit
-                self.current_token_usage = self.calculate_context_usage();
-                true
-            }
-            Action::SummaryReady(summary, count) => {
-                self.conversation_summary = Some(summary);
-                self.summarized_count = count; // Replace old summary scope with new one
-                self.is_summarizing = false;
-                self.current_token_usage = self.calculate_context_usage();
-                true
-            }
-            Action::EnterModelSelect => {
-                self.mode = Mode::ModelSelect;
-                true
-            }
-            Action::SwitchMode(mode) => {
-                self.mode = mode;
-                true
-            }
-            Action::ClearHistory => {
-                self.messages.clear();
-                self.current_response_buffer.clear();
-                self.vertical_scroll = 0;
-                self.save_session();
-                true
-            }
-            Action::EnterSystemPromptEdit => {
-                self.mode = Mode::SystemPromptEdit;
-                self.system_prompt_input =
-                    TextArea::new(self.system_prompt.lines().map(|s| s.to_string()).collect());
-                self.system_prompt_input.set_block(
-                    ratatui::widgets::Block::default()
-                        .borders(ratatui::widgets::Borders::ALL)
-                        .title(" Edit System Prompt (Esc to Cancel, Enter to Save) "),
-                );
-                self.system_prompt_input
-                    .set_cursor_line_style(Style::default());
-                true
-            }
-            Action::UpdateSystemPrompt(prompt) => {
-                self.system_prompt = prompt;
-                self.mode = Mode::Insert;
-                true
-            }
-            Action::Scroll(delta) => {
-                if delta > 0 {
-                    self.vertical_scroll = self.vertical_scroll.saturating_add(delta as u16);
-                } else {
-                    self.vertical_scroll = self.vertical_scroll.saturating_sub(delta.abs() as u16);
-                }
-                
-                // If we scroll manually, generally disable autoscroll UNLESS we hit bottom? 
-                // Actually the requirement is "Scrolling down past the last bubble should visually unselect the bubble".
-                // We'll handle visual unselect in ui.rs calculation OR just clear selection here if we are at bottom.
-                // But we don't know "total_height" here in App easily without recalculating.
-                // However, user said "scrolling down past the last bubble". 
-                // If we just unselect when `auto_scroll` becomes true (which happens in scroll_to_bottom), 
-                // or we can heuristically say if we scroll down, and we were selected, maybe check bounds?
-                // Let's implement a simpler heuristic: If I scroll down while selected, 
-                // and I hit the end of messages, unselect?
-                // Actually, let's just leave it for now and let the user manually unselect or click?
-                // Wait, "Scrolling down past the lasr bubble should visually unselect the bubble"
-                // This implies getting back to "live" mode.
-                
-                self.auto_scroll = false;
-                
-                // If in tool confirmation mode, apply scroll to tool_scroll
-
-                if self.mode == Mode::ToolConfirmation {
-                     if delta > 0 {
-                        self.tool_scroll = self.tool_scroll.saturating_add(delta as u16);
-                    } else {
-                        self.tool_scroll = self.tool_scroll.saturating_sub(delta.abs() as u16);
-                    }
-                }
-                true
-            }
             Action::SendMessage => {
                 let content = self.input.lines().join("\n");
                 if content.trim().is_empty() {
@@ -909,6 +1020,12 @@ impl<'a> App<'a> {
             Action::AddUserMessage(msg) => {
                 // Reset tool call counter on new user message
                 self.consecutive_tool_calls = 0;
+
+                // Simple memory management: Keep configured limit of messages
+                if self.messages.len() >= self.max_history_messages {
+                    self.messages.remove(0);
+                }
+
                 self.messages.push(ChatMessage {
                     role: "user".to_string(),
                     content: msg,
@@ -950,6 +1067,76 @@ impl<'a> App<'a> {
                 }
                 true
             }
+            Action::AiResponseComplete => {
+                self.loading = false;
+                self.save_session();
+                
+                // Auto-Rename Session if it's the first exchange in "default"
+                if self.enable_session_autonaming 
+                   && self.current_session == "default" 
+                   && self.messages.len() <= 2 // 1 user, 1 assistant (approx)
+                   && !self.messages.is_empty()
+                {
+                     let _ = self.action_tx.send(Action::TriggerAutoNaming);
+                }
+
+                true
+            }
+            Action::CancelGeneration => {
+                if let Some(handle) = self.current_request_handle.take() {
+                    handle.abort();
+                }
+                self.loading = false;
+                if let Some(last) = self.messages.last_mut() {
+                    if last.role == "assistant" {
+                         last.content.push_str("\n[Cancelled]");
+                    }
+                }
+                self.save_session();
+                true
+            }
+            Action::CopyMessage => {
+                if let Some(idx) = self.selected_message_index {
+                    if let Some(msg) = self.messages.get(idx) {
+                        if let Some(clipboard) = &mut self.clipboard {
+                            if let Err(e) = clipboard.set_text(&msg.content) {
+                                self.error = Some(format!("Failed to copy: {}", e));
+                            } else {
+                                self.notification = Some(("Copied to clipboard!".to_string(), std::time::Instant::now()));
+                                self.selected_message_index = None;
+                                self.auto_scroll = true; 
+                            }
+                        } else {
+                            self.error = Some("Clipboard not available".to_string());
+                        }
+                    }
+                }
+                true
+            }
+            Action::MoveSelection(delta) => {
+                if self.messages.is_empty() {
+                    self.selected_message_index = None;
+                    return true;
+                }
+
+                let current_idx = self.selected_message_index.unwrap_or_else(|| self.messages.len().saturating_sub(1));
+                
+                let new_idx = if delta > 0 {
+                    current_idx.saturating_add(delta as usize).min(self.messages.len() - 1)
+                } else {
+                    current_idx.saturating_sub(delta.abs() as usize)
+                };
+
+                self.selected_message_index = Some(new_idx);
+                self.auto_scroll = false;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    async fn update_tools(&mut self, action: Action) -> bool {
+        match action {
             Action::AddToolCall(tool_call) => {
                 // Increment consecutive tool call counter
                 self.consecutive_tool_calls += 1;
@@ -979,8 +1166,11 @@ impl<'a> App<'a> {
                                 self.mode = Mode::ToolConfirmation;
                                 self.tool_scroll = 0; // Reset scroll
                                 self.loading = false; // Stop loading spinner while waiting for user
+                                self.is_tool_executing = false;
                                 return true;
                             }
+                            
+                            self.is_tool_executing = true;
 
                             let tx = self.action_tx.clone();
                             let tool_arc = tool.clone();
@@ -1017,13 +1207,13 @@ impl<'a> App<'a> {
                 self.save_session();
                 true
             }
-
             Action::ConfirmToolExecution => {
                 if let Some(tool_call) = self.pending_tool_call.take() {
                     let tool_name = tool_call.function.name.clone();
                     let tool_args = tool_call.function.arguments.clone();
                     
                     self.loading = true; // Resume loading
+                    self.is_tool_executing = true;
                     self.mode = Mode::Insert;
 
                     if let Some(tool) = self.tools.get(&tool_name) {
@@ -1059,13 +1249,20 @@ impl<'a> App<'a> {
                         "Tool execution denied by user.".to_string(),
                     ));
                     self.mode = Mode::Insert;
+                    self.is_tool_executing = false;
                 }
                 true
             }
             Action::AddToolOutput(name, output) => {
-                // Ingest tool output into RAG
+                self.is_tool_executing = false;
+                
+                // Spawn async ingestion
                 let output_clone = output.clone();
-                let _ = self.rag.add_text(&output_clone).await;
+                let rag_clone = Arc::new(self.rag.clone());
+                
+                tokio::spawn(async move {
+                    let _ = rag_clone.add_text(&output_clone, Some("default".to_string())).await;
+                });
 
                 self.messages.push(ChatMessage {
                     role: "tool".to_string(),
@@ -1078,12 +1275,12 @@ impl<'a> App<'a> {
                 self.save_session();
                 true
             }
-            Action::AiResponseComplete => {
-                self.loading = false;
-                self.save_session();
-                true
-            }
-            // Session Actions
+            _ => false,
+        }
+    }
+
+    fn update_session(&mut self, action: Action) -> bool {
+        match action {
             Action::EnterSessionSelect => {
                 self.list_sessions();
                 self.mode = Mode::SessionSelect;
@@ -1126,56 +1323,6 @@ impl<'a> App<'a> {
                 self.mode = Mode::Insert;
                 true
             }
-            Action::CancelGeneration => {
-                if let Some(handle) = self.current_request_handle.take() {
-                    handle.abort();
-                }
-                self.loading = false;
-                if let Some(last) = self.messages.last_mut() {
-                    if last.role == "assistant" {
-                         last.content.push_str("\n[Cancelled]");
-                    }
-                }
-                self.save_session();
-                true
-            }
-            Action::CopyMessage => {
-                if let Some(idx) = self.selected_message_index {
-                    if let Some(msg) = self.messages.get(idx) {
-                        if let Some(clipboard) = &mut self.clipboard {
-                            if let Err(e) = clipboard.set_text(&msg.content) {
-                                self.error = Some(format!("Failed to copy: {}", e));
-                            } else {
-                                self.notification = Some(("Copied to clipboard!".to_string(), std::time::Instant::now()));
-                                self.selected_message_index = None;
-                                self.auto_scroll = true; // Go back to normal behavior? Or just unselect.
-                                // "Automatically unselect after copying"
-                            }
-                        } else {
-                            self.error = Some("Clipboard not available".to_string());
-                        }
-                    }
-                }
-                true
-            }
-            Action::MoveSelection(delta) => {
-                if self.messages.is_empty() {
-                    self.selected_message_index = None;
-                    return true;
-                }
-
-                let current_idx = self.selected_message_index.unwrap_or_else(|| self.messages.len().saturating_sub(1));
-                
-                let new_idx = if delta > 0 {
-                    current_idx.saturating_add(delta as usize).min(self.messages.len() - 1)
-                } else {
-                    current_idx.saturating_sub(delta.abs() as usize)
-                };
-
-                self.selected_message_index = Some(new_idx);
-                self.auto_scroll = false;
-                true
-            }
             Action::DeleteSession(name) => {
                 if let Some(path) = self.get_session_path(&name) {
                     let _ = fs::remove_file(path);
@@ -1204,9 +1351,135 @@ impl<'a> App<'a> {
                 }
                 true
             }
-            Action::SessionsLoaded(_) => true, // Handled in EnterSessionSelect mostly
+            Action::SessionsLoaded(_) => true,
+            Action::TriggerAutoNaming => {
+                let messages_snapshot = self.messages.clone();
+                if messages_snapshot.is_empty() { return true; }
+                
+                let client = self.ollama_client.clone();
+                let model = self.models.get(self.selected_model).cloned().unwrap_or("llama2".to_string());
+                let tx = self.action_tx.clone();
 
-            // Model Management Actions
+                tokio::spawn(async move {
+                    // Create prompt for naming
+                    let prompt = "Summarize the above conversation into a concise file-safe title (max 4-6 words, use underscores/hyphens instead of spaces, NO extension, NO special chars). Return ONLY the title string.";
+                    
+                    let mut context = messages_snapshot.iter().map(|m| ChatMessageRequest {
+                        role: m.role.clone(),
+                        content: m.content.clone(),
+                        images: None,
+                        tool_calls: None,
+                        tool_name: None,
+                    }).collect::<Vec<_>>();
+                    
+                    context.push(ChatMessageRequest {
+                        role: "user".to_string(),
+                        content: prompt.to_string(),
+                        images: None,
+                        tool_calls: None,
+                        tool_name: None,
+                    });
+
+                    // We use a separate non-streaming request or just stream and buffer
+                    // Let's use chat stream and accumulate
+                    if let Ok(mut stream) = client.chat(&model, context, None, None).await {
+                         let mut name_acc = String::new();
+                         while let Some(res) = stream.next().await {
+                             if let Ok(ChatStreamEvent::Token(t)) = res {
+                                 name_acc.push_str(&t);
+                             }
+                         }
+                         
+                         let clean_name = name_acc.trim()
+                             .replace(['"', '\'', '`', '\n', '\r'], "")
+                             .replace(' ', "_")
+                             .chars()
+                             .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+                             .take(50)
+                             .collect::<String>();
+                         
+                         if !clean_name.is_empty() {
+                             let _ = tx.send(Action::RenameSession(clean_name));
+                         }
+                    }
+                });
+                true
+            }
+            Action::RenameSession(new_name) => {
+                let old_name = self.current_session.clone();
+                // 1. Rename file
+                if let Some(old_path) = self.get_session_path(&old_name) {
+                    if let Some(mut new_path) = self.get_session_path(&new_name) {
+                        // Ensure we don't overwrite existing
+                        if new_path.exists() {
+                             // Append random suffix or timestamp
+                             let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+                             new_path = self.get_session_path(&format!("{}_{}", new_name, timestamp)).unwrap();
+                        }
+                        
+                        if let Ok(_) = fs::rename(&old_path, &new_path) {
+                            // 2. Update state
+                            self.current_session = new_path.file_stem().unwrap().to_string_lossy().to_string();
+                            self.notification = Some((format!("Renamed session to: {}", self.current_session), std::time::Instant::now()));
+                            self.list_sessions(); // Refresh list
+                        } else {
+                            self.error = Some(format!("Failed to rename session file"));
+                        }
+                    }
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn update_model(&mut self, action: Action) -> bool {
+        match action {
+            Action::LoadModels => {
+                self.loading = true;
+                let client = self.ollama_client.clone();
+                let tx = self.action_tx.clone();
+                tokio::spawn(async move {
+                    match client.list_models().await {
+                        Ok(models) => {
+                            let _ = tx.send(Action::ModelsLoaded(models));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Action::Error(e.to_string()));
+                        }
+                    }
+                });
+                true
+            }
+            Action::ModelsLoaded(models) => {
+                self.loading = false;
+                self.models = models;
+                if !self.models.is_empty() {
+                    self.selected_model = 0;
+                    // Trigger fetching context limit for the default selected model
+                    let model_name = self.models[0].clone();
+                    let client = self.ollama_client.clone();
+                    let tx = self.action_tx.clone();
+                    tokio::spawn(async move {
+                        if let Ok(info) = client.show_model(&model_name).await {
+                            if let Some(limit) = info.context_length() {
+                                let _ = tx.send(Action::UpdateModelContextLimit(limit));
+                            }
+                        }
+                    });
+                }
+                true
+            }
+            Action::UpdateModelContextLimit(limit) => {
+                self.model_context_limit = Some(limit);
+                // Re-calculate token usage with new limit
+                self.current_token_usage = self.calculate_context_usage();
+                true
+            }
+            Action::EnterModelSelect => {
+                self.mode = Mode::ModelSelect;
+                true
+            }
             Action::EnterModelPull => {
                 self.mode = Mode::ModelPullInput;
                 self.pull_input = TextArea::default();
@@ -1281,7 +1554,110 @@ impl<'a> App<'a> {
                 });
                 true
             }
+            _ => false,
+        }
+    }
 
+    /// Updates the application state based on the received action.
+    ///
+    /// This is the main state transition function. It handles:
+    /// - Chat updates (sending/receiving messages)
+    /// - Tool execution results
+    /// - Session management
+    /// - Model management
+    /// - UI state changes (scrolling, mode switching)
+    ///
+    /// Returns `true` if the UI needs to be re-rendered.
+    pub async fn update(&mut self, action: Action) -> bool {
+        // Try specific updaters first
+        if self.update_chat(action.clone()).await {
+            return true;
+        }
+        if self.update_tools(action.clone()).await {
+            return true;
+        }
+        if self.update_session(action.clone()) {
+            return true;
+        }
+        if self.update_model(action.clone()) {
+            return true;
+        }
+
+        match action {
+            Action::Error(e) => {
+                self.error = Some(e);
+                self.loading = false;
+                self.is_tool_executing = false;
+                true
+            }
+            Action::SummaryReady(summary, count) => {
+                self.conversation_summary = Some(summary);
+                self.summarized_count = count; // Replace old summary scope with new one
+                self.is_summarizing = false;
+                self.current_token_usage = self.calculate_context_usage();
+                true
+            }
+            Action::RagContextReady(context) => {
+                self.start_generation(context).await;
+                true
+            }
+            Action::GeolocationReady(loc) => {
+                self.location = Some(loc.clone());
+                // Optional: Notify user
+                self.notification = Some((format!("Location detected: {}", loc), std::time::Instant::now()));
+                true
+            }
+            Action::ShowStatus(msg) => {
+                self.notification = Some((msg, std::time::Instant::now()));
+                true
+            }
+            Action::SwitchMode(mode) => {
+                self.mode = mode;
+                true
+            }
+            Action::ClearHistory => {
+                self.messages.clear();
+                self.current_response_buffer.clear();
+                self.vertical_scroll = 0;
+                self.save_session();
+                true
+            }
+            Action::EnterSystemPromptEdit => {
+                self.mode = Mode::SystemPromptEdit;
+                self.system_prompt_input =
+                    TextArea::new(self.system_prompt.lines().map(|s| s.to_string()).collect());
+                self.system_prompt_input.set_block(
+                    ratatui::widgets::Block::default()
+                        .borders(ratatui::widgets::Borders::ALL)
+                        .title(" Edit System Prompt (Esc to Cancel, Enter to Save) "),
+                );
+                self.system_prompt_input
+                    .set_cursor_line_style(Style::default());
+                true
+            }
+            Action::UpdateSystemPrompt(prompt) => {
+                self.system_prompt = prompt;
+                self.mode = Mode::Insert;
+                true
+            }
+            Action::Scroll(delta) => {
+                if delta > 0 {
+                    self.vertical_scroll = self.vertical_scroll.saturating_add(delta as u16);
+                } else {
+                    self.vertical_scroll = self.vertical_scroll.saturating_sub(delta.abs() as u16);
+                }
+                
+                self.auto_scroll = false;
+                
+                if self.mode == Mode::ToolConfirmation {
+                     if delta > 0 {
+                        self.tool_scroll = self.tool_scroll.saturating_add(delta as u16);
+                    } else {
+                        self.tool_scroll = self.tool_scroll.saturating_sub(delta.abs() as u16);
+                    }
+                }
+                true
+            }
             Action::UserInput(key) => {
                 // Global shortcuts
 
@@ -1332,8 +1708,6 @@ impl<'a> App<'a> {
                             {
                                 if self.loading {
                                    let _ = self.action_tx.send(Action::CancelGeneration);
-                                } else {
-                                    // if not loading, let main.rs handle global Ctrl+C or do nothing
                                 }
                             } else {
                                 self.input.input(Input::from(key));
@@ -1361,14 +1735,18 @@ impl<'a> App<'a> {
                                 let _ = self.action_tx.send(Action::EnterModelSelect);
                             }
                             KeyCode::F(1) => self.show_help = true,
+                            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                if self.loading {
+                                    let _ = self.action_tx.send(Action::CancelGeneration);
+                                }
+                            }
                             KeyCode::Esc => {
                                 self.selected_message_index = None;
-                                self.auto_scroll = false; // Stay where we are, or true? User usually wants to stop selecting.
-                                // If we don't set auto_scroll=true, we stay at current scroll pos.
+                                self.auto_scroll = false; 
                             }
-                            _ => {} // Ignore other keys in Normal mode
+                            _ => {} 
                         }
-                    }
+                    },
                     Mode::ModelSelect => {
                         match key.code {
                             KeyCode::Esc => {
@@ -1399,7 +1777,7 @@ impl<'a> App<'a> {
                                     let _ = self.action_tx.send(Action::DeleteModel(model.clone()));
                                 }
                             }
-                            _ => {} // Ignore other keys in ModelSelect mode
+                            _ => {} 
                         }
                     }
                     Mode::SystemPromptEdit => match key.code {
@@ -1525,17 +1903,7 @@ mod tests {
     #[tokio::test]
     async fn test_app_initialization() {
         let (tx, _rx) = mpsc::unbounded_channel();
-        let config = Config {
-            ollama_url: "http://localhost:11434".to_string(),
-            context_token_limit: 4096,
-            system_prompt: "You are helpful".to_string(),
-            ignored_patterns: vec![],
-            auto_context: true,
-            summarization_enabled: true,
-            summarization_threshold: 0.8,
-            searxng_url: "http://localhost:8080".to_string(),
-            embedding_model: "nomic-embed-text".to_string(),
-        };
+        let config = Config::new_test_config();
         let app = App::new(tx, config, false, None);
 
         assert!(app.messages.is_empty());
@@ -1546,17 +1914,7 @@ mod tests {
     #[tokio::test]
     async fn test_add_user_message() {
         let (tx, _rx) = mpsc::unbounded_channel();
-        let config = Config {
-            ollama_url: "http://localhost:11434".to_string(),
-            context_token_limit: 4096,
-            system_prompt: "You are helpful".to_string(),
-            ignored_patterns: vec![],
-            auto_context: true,
-            summarization_enabled: true,
-            summarization_threshold: 0.8,
-            searxng_url: "http://localhost:8080".to_string(),
-            embedding_model: "nomic-embed-text".to_string(),
-        };
+        let config = Config::new_test_config();
         let mut app = App::new(tx, config, false, None);
         app.models = vec!["test-model".to_string()]; // Mock models
 
@@ -1578,17 +1936,7 @@ mod tests {
     #[tokio::test]
     async fn test_models_loaded() {
         let (tx, _rx) = mpsc::unbounded_channel();
-        let config = Config {
-            ollama_url: "http://localhost:11434".to_string(),
-            context_token_limit: 4096,
-            system_prompt: "You are helpful".to_string(),
-            ignored_patterns: vec![],
-            auto_context: true,
-            summarization_enabled: true,
-            summarization_threshold: 0.8,
-            searxng_url: "http://localhost:8080".to_string(),
-            embedding_model: "nomic-embed-text".to_string(),
-        };
+        let config = Config::new_test_config();
         let mut app = App::new(tx, config, false, None);
 
         let models = vec!["model1".to_string(), "model2".to_string()];
@@ -1601,17 +1949,7 @@ mod tests {
     #[tokio::test]
     async fn test_user_typing() {
         let (tx, _rx) = mpsc::unbounded_channel();
-        let config = Config {
-            ollama_url: "http://localhost:11434".to_string(),
-            context_token_limit: 4096,
-            system_prompt: "You are helpful".to_string(),
-            ignored_patterns: vec![],
-            auto_context: true,
-            summarization_enabled: true,
-            summarization_threshold: 0.8,
-            searxng_url: "http://localhost:8080".to_string(),
-            embedding_model: "nomic-embed-text".to_string(),
-        };
+        let config = Config::new_test_config();
         let mut app = App::new(tx, config, false, None);
 
         // Type 'a'
@@ -1624,17 +1962,7 @@ mod tests {
     #[tokio::test]
     async fn test_scroll_logic() {
         let (tx, _rx) = mpsc::unbounded_channel();
-        let config = Config {
-            ollama_url: "http://localhost:11434".to_string(),
-            context_token_limit: 4096,
-            system_prompt: "You are helpful".to_string(),
-            ignored_patterns: vec![],
-            auto_context: true,
-            summarization_enabled: true,
-            summarization_threshold: 0.8,
-            searxng_url: "http://localhost:8080".to_string(),
-            embedding_model: "nomic-embed-text".to_string(),
-        };
+        let config = Config::new_test_config();
         let mut app = App::new(tx, config, false, None);
 
         app.vertical_scroll = 10;
@@ -1648,17 +1976,7 @@ mod tests {
     #[tokio::test]
     async fn test_error_handling() {
         let (tx, _rx) = mpsc::unbounded_channel();
-        let config = Config {
-            ollama_url: "http://localhost:11434".to_string(),
-            context_token_limit: 4096,
-            system_prompt: "You are helpful".to_string(),
-            ignored_patterns: vec![],
-            auto_context: true,
-            summarization_enabled: true,
-            summarization_threshold: 0.8,
-            searxng_url: "http://localhost:8080".to_string(),
-            embedding_model: "nomic-embed-text".to_string(),
-        };
+        let config = Config::new_test_config();
         let mut app = App::new(tx, config, false, None);
 
         app.update(Action::Error("Connection failed".to_string()))
@@ -1670,17 +1988,7 @@ mod tests {
     #[tokio::test]
     async fn test_model_select_toggle() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let config = Config {
-            ollama_url: "http://localhost:11434".to_string(),
-            context_token_limit: 4096,
-            system_prompt: "You are helpful".to_string(),
-            ignored_patterns: vec![],
-            auto_context: true,
-            summarization_enabled: true,
-            summarization_threshold: 0.8,
-            searxng_url: "http://localhost:8080".to_string(),
-            embedding_model: "nomic-embed-text".to_string(),
-        };
+        let config = Config::new_test_config();
         let mut app = App::new(tx, config, false, None);
 
         app.update(Action::EnterModelSelect).await;
@@ -1703,17 +2011,7 @@ mod tests {
     #[tokio::test]
     async fn test_help_menu_toggle() {
         let (tx, _rx) = mpsc::unbounded_channel();
-        let config = Config {
-            ollama_url: "http://localhost:11434".to_string(),
-            context_token_limit: 4096,
-            system_prompt: "You are helpful".to_string(),
-            ignored_patterns: vec![],
-            auto_context: true,
-            summarization_enabled: true,
-            summarization_threshold: 0.8,
-            searxng_url: "http://localhost:8080".to_string(),
-            embedding_model: "nomic-embed-text".to_string(),
-        };
+        let config = Config::new_test_config();
         let mut app = App::new(tx, config, false, None);
 
         // Open with F1
@@ -1768,17 +2066,7 @@ mod tests {
     #[tokio::test]
     async fn test_loading_stays_true_during_stream() {
         let (tx, _rx) = mpsc::unbounded_channel();
-        let config = Config {
-            ollama_url: "http://localhost:11434".to_string(),
-            context_token_limit: 4096,
-            system_prompt: "You are helpful".to_string(),
-            ignored_patterns: vec![],
-            auto_context: true,
-            summarization_enabled: true,
-            summarization_threshold: 0.8,
-            searxng_url: "http://localhost:8080".to_string(),
-            embedding_model: "nomic-embed-text".to_string(),
-        };
+        let config = Config::new_test_config();
         let mut app = App::new(tx, config, false, None);
         app.models = vec!["test".to_string()];
 
@@ -1802,17 +2090,7 @@ mod tests {
     #[tokio::test]
     async fn test_ctrl_o_enters_model_select() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let config = Config {
-            ollama_url: "http://localhost:11434".to_string(),
-            context_token_limit: 4096,
-            system_prompt: "You are helpful".to_string(),
-            ignored_patterns: vec![],
-            auto_context: true,
-            summarization_enabled: true,
-            summarization_threshold: 0.8,
-            searxng_url: "http://localhost:8080".to_string(),
-            embedding_model: "nomic-embed-text".to_string(),
-        };
+        let config = Config::new_test_config();
         let mut app = App::new(tx, config, false, None);
 
         // Press Ctrl+o
@@ -1830,17 +2108,7 @@ mod tests {
     #[tokio::test]
     async fn test_add_tool_call() {
         let (tx, _rx) = mpsc::unbounded_channel();
-        let config = Config {
-            ollama_url: "http://localhost:11434".to_string(),
-            context_token_limit: 4096,
-            system_prompt: "You are helpful".to_string(),
-            ignored_patterns: vec![],
-            auto_context: true,
-            summarization_enabled: true,
-            summarization_threshold: 0.8,
-            searxng_url: "http://localhost:8080".to_string(),
-            embedding_model: "nomic-embed-text".to_string(),
-        };
+        let config = Config::new_test_config();
         let mut app = App::new(tx, config, false, None);
 
         // Setup conversation state
@@ -1876,20 +2144,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_context_window_logic() {
+    #[tokio::test]
+    async fn test_context_window_logic() {
         let (tx, _rx) = mpsc::unbounded_channel();
-        let config = Config {
-            ollama_url: "http://localhost:11434".to_string(),
-            context_token_limit: 2048, // Safe limit > buffer + system context
-            system_prompt: "HI".to_string(),
-            ignored_patterns: vec![],
-            auto_context: true,
-            summarization_enabled: true,
-            summarization_threshold: 0.8,
-            searxng_url: "http://localhost:8080".to_string(),
-            embedding_model: "nomic-embed-text".to_string(),
-        };
+        let mut config = Config::new_test_config();
+        config.context_token_limit = 2048;
+        config.system_prompt = "HI".to_string();
         let mut app = App::new(tx, config, false, None);
 
         // Add a huge message that won't fit in the remaining space
@@ -1925,17 +2185,7 @@ mod tests {
     #[tokio::test]
     async fn test_cancel_generation() {
         let (tx, _rx) = mpsc::unbounded_channel();
-        let config = Config {
-            ollama_url: "http://localhost:11434".to_string(),
-            context_token_limit: 4096,
-            system_prompt: "You are helpful".to_string(),
-            ignored_patterns: vec![],
-            auto_context: true,
-            summarization_enabled: true,
-            summarization_threshold: 0.8,
-            searxng_url: "http://localhost:8080".to_string(),
-            embedding_model: "nomic-embed-text".to_string(),
-        };
+        let config = Config::new_test_config();
         let mut app = App::new(tx, config, false, None);
 
         app.loading = true;
@@ -1965,17 +2215,7 @@ mod tests {
     #[tokio::test]
     async fn test_move_selection() {
         let (tx, _rx) = mpsc::unbounded_channel();
-        let config = Config {
-             ollama_url: "http://localhost:11434".to_string(),
-             context_token_limit: 4096,
-             system_prompt: "You are helpful".to_string(),
-             ignored_patterns: vec![],
-             auto_context: true,
-             summarization_enabled: true,
-             summarization_threshold: 0.8,
-            searxng_url: "http://localhost:8080".to_string(),
-            embedding_model: "nomic-embed-text".to_string(),
-        };
+        let config = Config::new_test_config();
         let mut app = App::new(tx, config, false, None);
         
         app.messages.push(ChatMessage { role: "user".to_string(), content: "1".to_string(), images: None, tool_calls: None, tool_name: None });
@@ -2003,17 +2243,7 @@ mod tests {
     #[tokio::test]
     async fn test_copy_notification_and_unselect() {
         let (tx, _rx) = mpsc::unbounded_channel();
-        let config = Config {
-             ollama_url: "http://localhost:11434".to_string(),
-             context_token_limit: 4096,
-             system_prompt: "You are helpful".to_string(),
-             ignored_patterns: vec![],
-             auto_context: true,
-             summarization_enabled: true,
-             summarization_threshold: 0.8,
-            searxng_url: "http://localhost:8080".to_string(),
-            embedding_model: "nomic-embed-text".to_string(),
-        };
+        let config = Config::new_test_config();
         let mut app = App::new(tx, config, false, None);
         
         let msg = ChatMessage { role: "assistant".to_string(), content: "test".to_string(), images: None, tool_calls: None, tool_name: None };
@@ -2027,7 +2257,77 @@ mod tests {
         } else {
              assert!(app.notification.is_some());
              assert_eq!(app.notification.as_ref().unwrap().0, "Copied to clipboard!");
-             assert!(app.selected_message_index.is_none());
         }
+        assert!(app.selected_message_index.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_cancel_in_normal_mode() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let config = Config::new_test_config();
+        let mut app = App::new(tx, config, false, None);
+
+        app.loading = true;
+        app.mode = Mode::Normal;
+        
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+        });
+        app.current_request_handle = Some(handle.abort_handle());
+
+        // Simulate Ctrl+C in Normal Mode
+        app.update(Action::UserInput(KeyEvent {
+            code: KeyCode::Char('c'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: crossterm::event::KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::empty(),
+        })).await;
+
+        // Verify CancelGeneration was sent
+        // We might have other setup actions like LoadModels/ModelsLoaded in queue from App::new?
+        // App::new spawns LoadModels logic if we are not careful? No, App::new just sends LoadModels.
+        // So we might need to drain a few messages.
+        
+        // Actually App::new doesn't send LoadModels automatically. `main.rs` sends it.
+        // But `App::new` spawns ContextManager? 
+        // Let's just check if we receive CancelGeneration eventually or immediately.
+        
+        let mut found_cancel = false;
+        while let Ok(action) = rx.try_recv() {
+            if action == Action::CancelGeneration {
+                found_cancel = true;
+                break;
+            }
+        }
+        assert!(found_cancel, "Should have sent CancelGeneration action");
+    }
+    #[tokio::test]
+    async fn test_tool_execution_throbber_state() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config::new_test_config();
+        let mut app = App::new(tx, config, false, None);
+
+        // Pre-condition: Must have an assistant message to attach tool call to
+        app.messages.push(crate::ollama::ChatMessage {
+            role: "assistant".to_string(),
+            content: "Thinking...".to_string(),
+            images: None,
+            tool_calls: None,
+            tool_name: None,
+        });
+
+        // 1. Add Tool Call -> Should set is_tool_executing = true
+        let tool_call = ToolCall {
+            function: crate::ollama::ToolCallFunction {
+                name: "list_directory".to_string(),
+                arguments: serde_json::json!({"path": "."}),
+            },
+        };
+        app.update(Action::AddToolCall(tool_call)).await;
+        assert!(app.is_tool_executing, "Should be executing tool after AddToolCall");
+
+        // 2. Add Tool Output -> Should set is_tool_executing = false
+        app.update(Action::AddToolOutput("list_directory".to_string(), "file1".to_string())).await;
+        assert!(!app.is_tool_executing, "Should NOT be executing tool after output received");
     }
 }

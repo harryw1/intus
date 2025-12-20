@@ -7,21 +7,27 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::time::Duration;
 
+/// Client for interacting with the Ollama API.
 #[derive(Debug, Clone)]
 pub struct OllamaClient {
     client: Client,
     base_url: String,
 }
 
+/// Represents a single message in the chat history.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatMessage {
+    /// The role of the message sender (e.g., "user", "assistant", "system", "tool").
     pub role: String,
+    /// The text content of the message.
     pub content: String,
+    /// Optional list of base64-encoded images.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub images: Option<Vec<String>>,
+    /// Optional list of tool calls requested by the model.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
-    /// Name of the tool when role is "tool" (for tool response messages)
+    /// Name of the tool when role is "tool" (for tool response messages).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
 }
@@ -194,6 +200,11 @@ pub enum ChatStreamEvent {
 }
 
 impl OllamaClient {
+    /// Creates a new Ollama client.
+    ///
+    /// # Arguments
+    ///
+    /// * `base_url` - The base URL of the Ollama API (e.g., "http://localhost:11434").
     pub fn new(base_url: String) -> Self {
         Self {
             client: Client::builder()
@@ -204,6 +215,7 @@ impl OllamaClient {
         }
     }
 
+    /// Lists all locally available models.
     pub async fn list_models(&self) -> Result<Vec<String>> {
         let response = self
             .client
@@ -216,6 +228,7 @@ impl OllamaClient {
         Ok(response.models.into_iter().map(|m| m.name).collect())
     }
 
+    /// Deletes a model from the local storage.
     pub async fn delete_model(&self, name: &str) -> Result<()> {
         let request = DeleteModelRequest {
             name: name.to_string(),
@@ -272,6 +285,9 @@ impl OllamaClient {
         Ok(running.models)
     }
 
+    /// Pulls a model from the Ollama library.
+    ///
+    /// Returns a stream of progress updates.
     pub async fn pull_model(
         &self,
         name: &str,
@@ -329,6 +345,16 @@ impl OllamaClient {
         Ok(tokio_stream::wrappers::UnboundedReceiverStream::new(rx))
     }
 
+    /// Sends a chat request to the model.
+    ///
+    /// # Arguments
+    ///
+    /// * `model` - The name of the model to query.
+    /// * `messages` - The history of messages for context.
+    /// * `tools` - Optional list of tool definitions available to the model.
+    /// * `options` - Optional additional model parameters (e.g., temperature).
+    ///
+    /// Returns a stream of `ChatStreamEvent` (tokens or tool calls).
     pub async fn chat(
         &self,
         model: &str,
@@ -430,6 +456,7 @@ impl OllamaClient {
         Ok(stream)
     }
 
+    /// Generates vector embeddings for a given prompt.
     pub async fn generate_embeddings(&self, model: &str, prompt: &str) -> Result<Vec<f64>> {
         let request = GenerateEmbeddingRequest {
             model: model.to_string(),

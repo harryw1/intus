@@ -65,7 +65,7 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         .map(|s| s.as_str())
         .unwrap_or("No Model");
 
-    let title_text = format!(" Ollama TUI | Model: {} ", model_name);
+    let title_text = format!(" Tenere | Model: {} ", model_name);
     
     let header_style = Style::default()
         .fg(app.theme.header_fg)
@@ -131,8 +131,9 @@ fn render_chat_history(f: &mut Frame, app: &mut App, area: Rect) {
     }
 
     // 1. Calculate layouts
-    // Tuple: (height, Option<Text>, is_thinking, bubble_width)
-    let mut calculated_msgs: Vec<(u16, Option<Text>, bool, u16)> = Vec::new();
+    // Tuple: (height, Option<Text>, Option<String>, u16)
+    // Option<String> is the Throbber Label (Some("Thinking...") or Some("Executing Tool..."))
+    let mut calculated_msgs: Vec<(u16, Option<Text>, Option<String>, u16)> = Vec::new();
     let mut total_height: u16 = 0;
 
     let msg_count = app.messages.len();
@@ -146,11 +147,12 @@ fn render_chat_history(f: &mut Frame, app: &mut App, area: Rect) {
             let height = 3;
             // Thinking bubble fixed width or dynamic? Let's make it fixed wide enough for "Thinking..."
             let bubble_width = 16.min(max_available_width); 
-            calculated_msgs.push((height, None, true, bubble_width));
+            calculated_msgs.push((height, None, Some("Thinking...".to_string()), bubble_width));
             total_height += height;
         } else {
             let content_to_render = if msg.tool_name.is_some() {
-                 insert_soft_hyphens(&msg.content)
+                 let raw_content = insert_soft_hyphens(&msg.content);
+                 truncate_content(&raw_content, 30)
             } else {
                 msg.content.clone()
             };
@@ -172,9 +174,17 @@ fn render_chat_history(f: &mut Frame, app: &mut App, area: Rect) {
 
             let height = estimate_wrapped_height(&md, wrapping_width) + 2; // +2 for border height
 
-            calculated_msgs.push((height, Some(md), false, bubble_width));
+            calculated_msgs.push((height, Some(md), None, bubble_width));
             total_height += height;
         }
+    }
+
+    // Add margins (1 line between bubbles)
+    if app.is_tool_executing {
+        let height = 3;
+        let bubble_width = 22.min(max_available_width);
+        calculated_msgs.push((height, None, Some("Executing Tool...".to_string()), bubble_width));
+        total_height += height;
     }
 
     // Add margins (1 line between bubbles)
@@ -224,10 +234,20 @@ fn render_chat_history(f: &mut Frame, app: &mut App, area: Rect) {
     // Render Visible Bubbles
     let mut current_y = -(app.vertical_scroll as i32);
 
-    for (i, (height, text_opt, is_thinking, bubble_width)) in calculated_msgs.into_iter().enumerate() {
-        let msg_role = &app.messages[i].role;
-        let is_user = msg_role == "user";
-        let is_tool = app.messages[i].tool_name.is_some();
+    for (i, (height, text_opt, throbber_label, bubble_width)) in calculated_msgs.into_iter().enumerate() {
+        // Safe access to messages, but handle virtual bubbles (throbber without message index)
+        let (_msg_role, is_user, is_tool) = if i < app.messages.len() {
+             let m = &app.messages[i];
+             (&m.role, m.role == "user", m.tool_name.is_some())
+        } else {
+             // Virtual bubble (Thinking or Tool Execution) logic
+             // "Thinking..." replaces the empty assistant message in the loop, so it has index i < messages.len()
+             // BUT "Executing Tool..." is APPENDED, so `i` might be >= messages.len().
+             // Actually, `Thinking` block in loop REPLACES the content display but consumes the message index.
+             // `Executing Tool` block is NEW.
+             // So if i >= messages.len(), it's the extra throbber.
+             (&"assistant".to_string(), false, false)
+        };
         let bubble_height = height;
 
         if current_y + (bubble_height as i32) > 0 && current_y < (viewport_height as i32) {
@@ -256,7 +276,13 @@ fn render_chat_history(f: &mut Frame, app: &mut App, area: Rect) {
                 let (border_color, title) = if is_user {
                     (app.theme.user_bubble_border, " You ".to_string())
                 } else if is_tool {
-                      (app.theme.tool_bubble_fg, format!(" Tool Output: {} ", app.messages[i].tool_name.as_deref().unwrap_or("Unknown")))
+                      // Be careful with index access here if i >= messages.len()
+                      let tool_name = if i < app.messages.len() {
+                          app.messages[i].tool_name.as_deref().unwrap_or("Unknown")
+                      } else {
+                          "Unknown"
+                      };
+                      (app.theme.tool_bubble_fg, format!(" Tool Output: {} ", tool_name))
                 } else {
                     (app.theme.ai_bubble_border, " AI ".to_string())
                 };
@@ -286,8 +312,8 @@ fn render_chat_history(f: &mut Frame, app: &mut App, area: Rect) {
                 // Or just assume the user knows Left=User, Right=AI?
                 // Let's put a small header span inside the paragraph.
 
-                if is_thinking {
-                    let throbber = Throbber::default().label("Thinking...").throbber_style(
+                if let Some(label) = throbber_label {
+                    let throbber = Throbber::default().label(label).throbber_style(
                         Style::default()
                             .fg(Color::LightCyan)
                             .add_modifier(Modifier::BOLD),
@@ -608,4 +634,42 @@ fn insert_soft_hyphens(text: &str) -> String {
     text.replace('/', "/\u{200B}")
         .replace('_', "_\u{200B}")
         .replace(',', ",\u{200B}")
+}
+
+fn truncate_content(text: &str, max_lines: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() > max_lines {
+        let truncated = lines[..max_lines].join("\n");
+        let _remaining = lines.len() - max_lines;
+        format!("{}\n\n... [Output truncated associated with tool usage. Total: {} lines]", truncated, lines.len())
+    } else {
+        text.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_truncate_content_short() {
+        let text = "Line 1\nLine 2\nLine 3";
+        // Should not truncate
+        assert_eq!(truncate_content(text, 5), text);
+    }
+
+    #[test]
+    fn test_truncate_content_long() {
+        let text = "1\n2\n3\n4\n5\n6";
+        // Truncate to 3 lines
+        let truncated = truncate_content(text, 3);
+        assert!(truncated.starts_with("1\n2\n3"));
+        assert!(truncated.contains("... [Output truncated associated with tool usage. Total: 6 lines]"));
+    }
+
+    #[test]
+    fn test_truncate_content_exact() {
+         let text = "1\n2\n3";
+         assert_eq!(truncate_content(text, 3), text);
+    }
 }
