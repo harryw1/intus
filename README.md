@@ -14,6 +14,15 @@
   - **Named Knowledge Bases**: Define "Work", "Personal", or "Code" folders in your config.
   - **Context Isolation**: Search results are strictly segregated to prevent data leaks.
   - **Background Indexing**: Add massive folders without freezing the UI.
+## Local Installation (Developers)
+
+To install the current local version via Homebrew (useful for testing):
+
+```bash
+make install
+```
+
+## Release Process (Maintainers)
 - **⚡ Autonomous Tools**:
   - **Safe Code Editing**: Line-based editing (`edit_file`) prevents "hallucinated" file corruption.
   - **Web Research**: Search the web and read pages (via SearXNG) with auto-summarization.
