@@ -1549,6 +1549,7 @@ dependencies = [
  "arboard",
  "bytes",
  "chrono",
+ "clap",
  "color-eyre",
  "comrak",
  "crossterm",

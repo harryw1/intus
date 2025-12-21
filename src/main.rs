@@ -22,6 +22,13 @@ use intus::logging;
 use tracing::{info, warn};
 use std::io::Write;
 
+use clap::Parser;
+
+/// A robust, privacy-first local AI assistant and system sidecar.
+#[derive(Parser)]
+#[command(version, about, long_about = None)]
+struct Cli {}
+
 /// The main entry point for the Ollama TUI application.
 ///
 /// This function:
@@ -33,6 +40,8 @@ use std::io::Write;
 /// 6. Cleans up the terminal state upon exit.
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let _cli = Cli::parse();
+
     // Initialize logging
     let _ = logging::init_logging();
     info!("Starting Intus");
