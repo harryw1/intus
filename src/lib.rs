@@ -9,3 +9,5 @@ pub mod theme;
 pub mod rag;
 pub mod persistence;
 pub mod logging;
+pub mod monologue;
+pub mod python;

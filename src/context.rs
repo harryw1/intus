@@ -236,6 +236,7 @@ mod tests {
                 images: None,
                 tool_calls: None,
                 tool_name: None,
+                thought: None,
             },
             ChatMessage {
                 role: "assistant".to_string(),
@@ -243,6 +244,7 @@ mod tests {
                 images: None,
                 tool_calls: None,
                 tool_name: None,
+                thought: None,
             },
         ];
 
@@ -261,6 +263,7 @@ mod tests {
                 images: None,
                 tool_calls: None,
                 tool_name: None,
+                thought: None,
             },
             ChatMessage {
                 role: "assistant".to_string(),
@@ -268,6 +271,7 @@ mod tests {
                 images: None,
                 tool_calls: None,
                 tool_name: None,
+                thought: None,
             },
             ChatMessage {
                 role: "user".to_string(),
@@ -275,6 +279,7 @@ mod tests {
                 images: None,
                 tool_calls: None,
                 tool_name: None,
+                thought: None,
             },
             ChatMessage {
                 role: "assistant".to_string(),
@@ -282,6 +287,7 @@ mod tests {
                 images: None,
                 tool_calls: None,
                 tool_name: None,
+                thought: None,
             },
         ];
 
@@ -302,6 +308,7 @@ mod tests {
             images: None,
             tool_calls: None,
             tool_name: None,
+            thought: None,
         }];
 
         let count = ContextManager::estimate_token_count(&messages);

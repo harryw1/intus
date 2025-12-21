@@ -30,6 +30,9 @@ pub struct ChatMessage {
     /// Name of the tool when role is "tool" (for tool response messages).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
+    /// Internal thought process (monologue) separate from content.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thought: Option<String>,
 }
 
 #[derive(Serialize)]

@@ -2,7 +2,8 @@ use crate::config::Config;
 use crate::process::ProcessTracker;
 use crate::context::ContextManager;
 use crate::ollama::{ChatMessage, ChatMessageRequest, ChatStreamEvent, OllamaClient, ToolCall};
-use crate::tools::{CatTool, GrepTool, ListDirectoryTool, ReadUrlTool, ReplaceTextTool, EditFileTool, RunCommandTool, SemanticSearchTool, Tool, WebSearchTool, WriteFileTool, MemoryTool, DeleteFileTool, SymbolSearchTool};
+use crate::tools::{CatTool, GrepTool, ListDirectoryTool, ReadUrlTool, ReplaceTextTool, EditFileTool, RunCommandTool, SemanticSearchTool, Tool, WebSearchTool, WriteFileTool, MemoryTool, DeleteFileTool, SymbolSearchTool, RunPythonTool};
+use crate::python::PythonRuntime;
 use crate::persistence::SessionManager;
 use crossterm::event::{KeyCode, KeyModifiers};
 use directories::{BaseDirs, ProjectDirs};
@@ -289,6 +290,7 @@ pub struct App<'a> {
     /// Detected or configured user location.
     pub location: Option<String>,
     pub enable_session_autonaming: bool,
+    pub monologue_parser: Option<crate::monologue::MonologueParser>,
 }
 
 impl<'a> App<'a> {
@@ -401,7 +403,7 @@ impl<'a> App<'a> {
                 rag: shared_rag.clone(),
                 ignored_patterns: config.ignored_patterns.clone(),
                 knowledge_bases: config.knowledge_bases.clone(),
-                status_tx: Some(status_tx),
+                status_tx: Some(status_tx.clone()),
             }),
         );
         tools.insert(
@@ -466,6 +468,22 @@ impl<'a> App<'a> {
                 process_tracker: process_tracker.clone(),
             }),
         );
+
+        // Initialize Python Runtime
+        match PythonRuntime::new() {
+            Ok(runtime) => {
+                tools.insert(
+                    "run_python".to_string(),
+                    Arc::new(RunPythonTool {
+                        runtime: Arc::new(runtime),
+                    }),
+                );
+            }
+            Err(e) => {
+                // Log but don't crash
+                 let _ = status_tx.send(format!("Starting without Python support: {}", e));
+            }
+        }
 
         // Spawn Session Saver Task - REPLACED by SessionManager
         let session_manager = SessionManager::new();
@@ -537,6 +555,7 @@ impl<'a> App<'a> {
             max_history_messages: config.max_history_messages,
             location: config.location.clone(),
             enable_session_autonaming: config.enable_session_autonaming,
+            monologue_parser: Some(crate::monologue::MonologueParser::new()),
         };
 
         if load_history {
@@ -757,6 +776,7 @@ impl<'a> App<'a> {
                 images: None,
                 tool_calls: None,
                 tool_name: None,
+
             });
         }
 
@@ -770,6 +790,7 @@ impl<'a> App<'a> {
                 images: None,
                 tool_calls: None,
                 tool_name: None,
+
             },
         );
 
@@ -914,6 +935,7 @@ impl<'a> App<'a> {
                     images: None,
                     tool_calls: None,
                     tool_name: None,
+                    thought: None,
                 });
                 self.current_response_buffer.clear();
             } else {
@@ -926,6 +948,7 @@ impl<'a> App<'a> {
                 images: None,
                 tool_calls: None,
                 tool_name: None,
+                thought: None,
             });
             self.current_response_buffer.clear();
         }
@@ -1064,6 +1087,7 @@ impl<'a> App<'a> {
                     images: None,
                     tool_calls: None,
                     tool_name: None,
+                    thought: None,
                 });
                 self.loading = true;
                 self.scroll_to_bottom();
@@ -1077,8 +1101,33 @@ impl<'a> App<'a> {
                 true
             }
             Action::AddAiToken(token) => {
-                // self.loading = false; // Don't stop loading state yet, wait for completion or content to render
-                self.current_response_buffer.push_str(&token);
+                // Pump token through parser
+                if let Some(parser) = &mut self.monologue_parser {
+                    let events = parser.process(&token);
+                    for event in events {
+                        match event {
+                             crate::monologue::StreamEvent::Content(c) => {
+                                 self.current_response_buffer.push_str(&c);
+                             }
+                             crate::monologue::StreamEvent::Thought(t) => {
+                                 if let Some(last) = self.messages.last_mut() {
+                                     if last.role == "assistant" {
+                                         if last.thought.is_none() {
+                                             last.thought = Some(String::new());
+                                         }
+                                         if let Some(thought) = &mut last.thought {
+                                             thought.push_str(&t);
+                                         }
+                                     }
+                                 }
+                             }
+                        }
+                    }
+                } else {
+                     // Fallback if parser missing (shouldn't happen)
+                     self.current_response_buffer.push_str(&token);
+                }
+
                 if let Some(last) = self.messages.last_mut() {
                     if last.role == "assistant" {
                         last.content = self.current_response_buffer.clone();
@@ -1100,6 +1149,35 @@ impl<'a> App<'a> {
                 true
             }
             Action::AiResponseComplete => {
+                // Flush parser
+                 if let Some(parser) = &mut self.monologue_parser {
+                    let events = parser.flush();
+                    for event in events {
+                        match event {
+                             crate::monologue::StreamEvent::Content(c) => {
+                                 self.current_response_buffer.push_str(&c);
+                             }
+                             crate::monologue::StreamEvent::Thought(t) => {
+                                 if let Some(last) = self.messages.last_mut() {
+                                     if last.role == "assistant" {
+                                         if last.thought.is_none() {
+                                             last.thought = Some(String::new());
+                                         }
+                                         if let Some(thought) = &mut last.thought {
+                                             thought.push_str(&t);
+                                         }
+                                     }
+                                 }
+                             }
+                        }
+                    }
+                    if let Some(last) = self.messages.last_mut() {
+                        if last.role == "assistant" {
+                            last.content = self.current_response_buffer.clone();
+                        }
+                    }
+                 }
+
                 self.loading = false;
                 self.save_session();
                 
@@ -1302,6 +1380,7 @@ impl<'a> App<'a> {
                     images: None,
                     tool_calls: None,
                     tool_name: Some(name),
+                    thought: None,
                 });
                 let _ = self.action_tx.send(Action::RequestAiResponse);
                 self.save_session();
@@ -2152,6 +2231,7 @@ mod tests {
             images: None,
             tool_calls: None,
             tool_name: None,
+            thought: None,
         });
 
         let tool_call = ToolCall {
@@ -2196,6 +2276,7 @@ mod tests {
             images: None,
             tool_calls: None,
             tool_name: None,
+            thought: None,
         });
 
         // Add a small recent message that should fit
@@ -2205,6 +2286,7 @@ mod tests {
             images: None,
             tool_calls: None,
             tool_name: None,
+            thought: None,
         });
 
         // Build context window from existing history
@@ -2236,6 +2318,7 @@ mod tests {
             images: None,
             tool_calls: None,
             tool_name: None,
+            thought: None,
         });
 
         app.update(Action::CancelGeneration).await;
@@ -2252,8 +2335,8 @@ mod tests {
         let config = Config::new_test_config();
         let mut app = App::new(tx, config, false, None);
         
-        app.messages.push(ChatMessage { role: "user".to_string(), content: "1".to_string(), images: None, tool_calls: None, tool_name: None });
-        app.messages.push(ChatMessage { role: "assistant".to_string(), content: "2".to_string(), images: None, tool_calls: None, tool_name: None });
+        app.messages.push(ChatMessage { role: "user".to_string(), content: "1".to_string(), images: None, tool_calls: None, tool_name: None, thought: None });
+        app.messages.push(ChatMessage { role: "assistant".to_string(), content: "2".to_string(), images: None, tool_calls: None, tool_name: None, thought: None });
 
         assert_eq!(app.selected_message_index, None);
 
@@ -2280,7 +2363,7 @@ mod tests {
         let config = Config::new_test_config();
         let mut app = App::new(tx, config, false, None);
         
-        let msg = ChatMessage { role: "assistant".to_string(), content: "test".to_string(), images: None, tool_calls: None, tool_name: None };
+        let msg = ChatMessage { role: "assistant".to_string(), content: "test".to_string(), images: None, tool_calls: None, tool_name: None, thought: None };
         app.messages.push(msg);
         app.selected_message_index = Some(0);
 
@@ -2348,6 +2431,7 @@ mod tests {
             images: None,
             tool_calls: None,
             tool_name: None,
+            thought: None,
         });
 
         // 1. Add Tool Call -> Should set is_tool_executing = true

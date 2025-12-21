@@ -79,6 +79,7 @@ pub mod web;
 pub mod system;
 pub mod code_intelligence;
 pub mod rag;
+pub mod python;
 
 // Re-export tools for easier access
 pub use filesystem::{ListDirectoryTool, GrepTool, CatTool, WriteFileTool, ReplaceTextTool, EditFileTool, DeleteFileTool};
@@ -86,5 +87,6 @@ pub use web::{WebSearchTool, ReadUrlTool};
 pub use system::RunCommandTool;
 pub use rag::{SemanticSearchTool, MemoryTool};
 pub use code_intelligence::SymbolSearchTool;
+pub use python::RunPythonTool;
 
 pub type StatusSender = tokio::sync::mpsc::UnboundedSender<String>;

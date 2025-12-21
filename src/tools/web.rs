@@ -59,7 +59,8 @@ IMPORTANT:
                 .unwrap_or_else(|_| reqwest::blocking::Client::new())
         });
         
-        if let Some(url) = url_arg {
+        // Fix: usage of filter to ignore empty strings which cause builder errors
+        if let Some(url) = url_arg.filter(|u| !u.is_empty()) {
              let response = client.get(url)
                  .header("User-Agent", "Mozilla/5.0 (compatible; Intus/1.0; +https://github.com/harryw1/intus)")
                  .send()?;

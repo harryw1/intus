@@ -206,7 +206,7 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         .map(|s| s.as_str())
         .unwrap_or("No Model");
 
-    let title_text = format!(" Tenere | Model: {} ", model_name);
+    let title_text = format!(" Intus | Model: {} ", model_name);
     
     let header_style = Style::default()
         .fg(app.theme.header_fg)
@@ -282,7 +282,8 @@ fn render_chat_history(f: &mut Frame, app: &mut App, area: Rect) {
         let is_thinking = app.loading
             && i == msg_count - 1
             && msg.role == "assistant"
-            && msg.content.trim().is_empty();
+            && msg.content.trim().is_empty()
+            && msg.thought.is_none(); // Only show generic thinking if no specific thought exists yet
 
         if is_thinking {
             let height = 3;
@@ -291,26 +292,59 @@ fn render_chat_history(f: &mut Frame, app: &mut App, area: Rect) {
             calculated_msgs.push((height, None, Some("Thinking...".to_string()), bubble_width));
             total_height += height;
         } else {
+            // Render Thought Bubble if present
+            if let Some(thought) = &msg.thought {
+                if !thought.trim().is_empty() {
+                    let thought_text = markdown_to_text(thought, max_available_width);
+                     
+                    // Calculate thought width logic (same as content)
+                    let thought_text_width = thought_text.lines.iter().map(|l| l.width()).max().unwrap_or(0) as u16;
+                    let required_width = thought_text_width.saturating_add(4);
+                    let bubble_width = required_width.clamp(14, max_available_width);
+                    let wrapping_width = bubble_width.saturating_sub(4);
+ 
+                    let height = estimate_wrapped_height(&thought_text, wrapping_width) + 2;
+                    
+                    // Use a special marker label for "Thought" rendering downstream
+                    calculated_msgs.push((height, Some(thought_text), Some("Internal Thought".to_string()), bubble_width));
+                    total_height += height;
+                    
+                    // Add small margin?
+                    // total_height += 1;
+                }
+            }
+
             let content_to_render = if msg.tool_name.is_some() {
                  let raw_content = insert_soft_hyphens(&msg.content);
                  truncate_content(&raw_content, 30)
+            } else if let Some(calls) = &msg.tool_calls {
+                 if msg.content.trim().is_empty() {
+                     let names: Vec<String> = calls.iter().map(|c| c.function.name.clone()).collect();
+                     format!("**Using Tool:** `{}`", names.join("`, `"))
+                 } else {
+                     msg.content.clone()
+                 }
             } else {
                 msg.content.clone()
             };
 
-            let text = markdown_to_text(&content_to_render, max_available_width);
-            
-            // Calculate content width
-            let content_text_width = text.lines.iter().map(|l| l.width()).max().unwrap_or(0) as u16;
-            
-            let required_width = content_text_width.saturating_add(4); // +4 for safe padding inside borders
-            let bubble_width = required_width.clamp(14, max_available_width);
-            let wrapping_width = bubble_width.saturating_sub(4); // Inner width for text wrapping
+            // Only render content if it's not empty OR if there are no thoughts (to avoid invisible messages)
+            // But sometimes assistant message starts with thought and has no content yet.
+            if !content_to_render.is_empty() || (msg.role == "assistant" && msg.thought.is_none()) {
+                let text = markdown_to_text(&content_to_render, max_available_width);
+                
+                // Calculate content width
+                let content_text_width = text.lines.iter().map(|l| l.width()).max().unwrap_or(0) as u16;
+                
+                let required_width = content_text_width.saturating_add(4); // +4 for safe padding inside borders
+                let bubble_width = required_width.clamp(14, max_available_width);
+                let wrapping_width = bubble_width.saturating_sub(4); // Inner width for text wrapping
 
-            let height = estimate_wrapped_height(&text, wrapping_width) + 2; // +2 for border height
+                let height = estimate_wrapped_height(&text, wrapping_width) + 2; // +2 for border height
 
-            calculated_msgs.push((height, Some(text), None, bubble_width));
-            total_height += height;
+                calculated_msgs.push((height, Some(text), None, bubble_width));
+                total_height += height;
+            }
         }
     }
 
@@ -450,20 +484,50 @@ fn render_chat_history(f: &mut Frame, app: &mut App, area: Rect) {
                 // Let's put a small header span inside the paragraph.
 
                 if let Some(label) = throbber_label {
-                    let throbber = Throbber::default().label(label).throbber_style(
-                        Style::default()
-                            .fg(Color::LightCyan)
-                            .add_modifier(Modifier::BOLD),
-                    );
-                    let thinking_block = Block::default()
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Rounded)
-                        .border_style(Style::default().fg(app.theme.ai_bubble_border))
-                        .title(" AI ");
-                    
-                    f.render_widget(thinking_block.clone(), rect);
-                     let inner_area = thinking_block.inner(rect);
-                    f.render_stateful_widget(throbber, inner_area, &mut app.spinner_state);
+                    if label == "Internal Thought" {
+                        // Render thought bubble
+                        // Use a specific style for thoughts (e.g., italic, dim)
+                         let thought_block = Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .border_style(Style::default().fg(Color::DarkGray)) 
+                            .title(Span::styled(" Thought ", Style::default().add_modifier(Modifier::ITALIC)));
+                        
+                        f.render_widget(thought_block.clone(), rect);
+                        let inner_area = thought_block.inner(rect);
+                        
+                        if let Some(text) = text_opt {
+                             // Apply dim/italic style to thought text
+                             let mut styled_text = text.clone();
+                             for line in &mut styled_text.lines {
+                                 for span in &mut line.spans {
+                                     span.style = span.style.add_modifier(Modifier::ITALIC).fg(Color::DarkGray);
+                                 }
+                             }
+                             
+                             let p = Paragraph::new(styled_text)
+                                 .wrap(Wrap { trim: false })
+                                 .alignment(ratatui::layout::Alignment::Left); // Thoughts always left
+                             f.render_widget(p, inner_area);
+                        }
+
+                    } else {
+                        // Normal Throbber (Thinking... / Executing Tool...)
+                        let throbber = Throbber::default().label(label.clone()).throbber_style(
+                            Style::default()
+                                .fg(Color::LightCyan)
+                                .add_modifier(Modifier::BOLD),
+                        );
+                        let thinking_block = Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .border_style(Style::default().fg(app.theme.ai_bubble_border))
+                            .title(" AI ");
+                        
+                        f.render_widget(thinking_block.clone(), rect);
+                        let inner_area = thinking_block.inner(rect);
+                        f.render_stateful_widget(throbber, inner_area, &mut app.spinner_state);
+                    }
                 } else if let Some(text) = text_opt {
                      // We need to inject the "Title" into the text or render it separately.
                      // A simple way is to use a block structure that has a top margin?
