@@ -1558,6 +1558,7 @@ dependencies = [
  "html2text",
  "ignore",
  "ratatui",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

@@ -77,6 +77,7 @@ pub struct VectorIndex {
 pub mod filesystem;
 pub mod web;
 pub mod system;
+pub mod code_intelligence;
 pub mod rag;
 
 // Re-export tools for easier access
@@ -84,5 +85,6 @@ pub use filesystem::{ListDirectoryTool, GrepTool, CatTool, WriteFileTool, Replac
 pub use web::{WebSearchTool, ReadUrlTool};
 pub use system::RunCommandTool;
 pub use rag::{SemanticSearchTool, MemoryTool};
+pub use code_intelligence::SymbolSearchTool;
 
 pub type StatusSender = tokio::sync::mpsc::UnboundedSender<String>;
