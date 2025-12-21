@@ -2,7 +2,7 @@ use crate::config::Config;
 use crate::process::ProcessTracker;
 use crate::context::ContextManager;
 use crate::ollama::{ChatMessage, ChatMessageRequest, ChatStreamEvent, OllamaClient, ToolCall};
-use crate::tools::{CatTool, GrepTool, ListDirectoryTool, ReadUrlTool, ReplaceTextTool, EditFileTool, RunCommandTool, SemanticSearchTool, Tool, WebSearchTool, WriteFileTool, MemoryTool};
+use crate::tools::{CatTool, GrepTool, ListDirectoryTool, ReadUrlTool, ReplaceTextTool, EditFileTool, RunCommandTool, SemanticSearchTool, Tool, WebSearchTool, WriteFileTool, MemoryTool, DeleteFileTool};
 use crate::persistence::SessionManager;
 use crossterm::event::{KeyCode, KeyModifiers};
 use directories::{BaseDirs, ProjectDirs};
@@ -376,6 +376,12 @@ impl<'a> App<'a> {
         tools.insert(
             "replace_text".to_string(),
             Arc::new(ReplaceTextTool {
+                ignored_patterns: config.ignored_patterns.clone(),
+            }),
+        );
+        tools.insert(
+            "delete_file".to_string(),
+            Arc::new(DeleteFileTool {
                 ignored_patterns: config.ignored_patterns.clone(),
             }),
         );

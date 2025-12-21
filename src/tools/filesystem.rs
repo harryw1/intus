@@ -644,6 +644,67 @@ impl Tool for ReplaceTextTool {
     }
 }
 
+pub struct DeleteFileTool {
+    pub ignored_patterns: Vec<String>,
+}
+
+impl Tool for DeleteFileTool {
+    fn name(&self) -> &str {
+        "delete_file"
+    }
+
+    fn description(&self) -> &str {
+        "USE THIS to DELETE a file. WARNING: This is permanent. Input: path. Checks for ignored patterns."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "The file path to delete."
+                }
+            },
+            "required": ["path"]
+        })
+    }
+
+    fn execute(&self, args: Value) -> Result<String> {
+        let raw_path = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing 'path' argument"))?;
+
+        let path = expand_path(raw_path);
+
+        if path.contains("..") {
+            return Err(anyhow::anyhow!("Security: '..' not allowed"));
+        }
+
+        for ignore in &self.ignored_patterns {
+            if path.contains(ignore) {
+                return Err(anyhow::anyhow!(
+                    "Access denied: Path contains ignored pattern '{}'",
+                    ignore
+                ));
+            }
+        }
+
+        if !std::path::Path::new(&path).exists() {
+             return Err(anyhow::anyhow!("File does not exist: {}", path));
+        }
+
+        std::fs::remove_file(&path)?;
+
+        Ok(format!("Successfully deleted {}", path))
+    }
+
+    fn requires_confirmation(&self) -> bool {
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -685,7 +746,10 @@ mod tests {
                 None,
             )),
         });
-        let args = serde_json::json!({ "path": file_path.to_str().unwrap() });
+        let args = serde_json::json!({ 
+            "path": file_path.to_str().unwrap(),
+            "numbered": false 
+        });
 
         let output = tokio::task::spawn_blocking(move || {
             tool.execute(args)
@@ -829,6 +893,25 @@ mod tests {
 
         let content = std::fs::read_to_string(&file_path)?;
         assert_eq!(content, "Initial + Appended");
+        Ok(())
+    }
+
+    #[test]
+    fn test_delete_file_tool() -> Result<()> {
+        let dir = tempdir()?;
+        let file_path = dir.path().join("delete_me.txt");
+        File::create(&file_path)?;
+
+        let tool = DeleteFileTool {
+            ignored_patterns: vec![],
+        };
+        let args = serde_json::json!({
+            "path": file_path.to_str().unwrap()
+        });
+
+        let output = tool.execute(args)?;
+        assert!(output.contains("Successfully deleted"));
+        assert!(!file_path.exists());
         Ok(())
     }
 }

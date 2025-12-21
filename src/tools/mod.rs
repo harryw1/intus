@@ -80,7 +80,7 @@ pub mod system;
 pub mod rag;
 
 // Re-export tools for easier access
-pub use filesystem::{ListDirectoryTool, GrepTool, CatTool, WriteFileTool, ReplaceTextTool, EditFileTool};
+pub use filesystem::{ListDirectoryTool, GrepTool, CatTool, WriteFileTool, ReplaceTextTool, EditFileTool, DeleteFileTool};
 pub use web::{WebSearchTool, ReadUrlTool};
 pub use system::RunCommandTool;
 pub use rag::{SemanticSearchTool, MemoryTool};
