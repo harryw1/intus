@@ -40,20 +40,26 @@ impl Tool for RunCommandTool {
     }
 
     fn execute(&self, args: Value) -> Result<String> {
-        let command_name = args
+        let raw_command = args
             .get("command")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'command' argument"))?;
 
-        let cmd_args: Vec<String> = args
-            .get("args")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .map(|v| v.as_str().unwrap_or_default().to_string())
-                    .collect()
-            })
-            .unwrap_or_default();
+        // Handle case where model puts args in command string (e.g. "curl -s ...")
+        let mut parts = raw_command.split_whitespace();
+        let command_name = parts.next().ok_or_else(|| anyhow::anyhow!("Empty command"))?;
+        
+        let extra_args: Vec<String> = parts.map(|s| s.to_string()).collect();
+
+        let mut cmd_args: Vec<String> = Vec::new();
+        
+        // Add extra args parsed from command string
+        cmd_args.extend(extra_args);
+
+        // Add regular args
+        if let Some(arr) = args.get("args").and_then(|v| v.as_array()) {
+             cmd_args.extend(arr.iter().map(|v| v.as_str().unwrap_or_default().to_string()));
+        }
 
         if !self.allowed_commands.contains(&command_name.to_string()) {
             return Err(anyhow::anyhow!(

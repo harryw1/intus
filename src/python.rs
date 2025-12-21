@@ -1,8 +1,7 @@
 use anyhow::{Context, Result};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use directories::BaseDirs;
 use std::process::Command;
-use std::io::Write;
 use std::fs;
 
 pub struct PythonRuntime {
@@ -49,6 +48,14 @@ impl PythonRuntime {
         Ok(())
     }
 
+    fn get_python_path(&self) -> PathBuf {
+        if cfg!(windows) {
+            self.venv_path.join("Scripts").join("python.exe")
+        } else {
+            self.venv_path.join("bin").join("python")
+        }
+    }
+
     pub fn install_packages(&self, packages: &[&str]) -> Result<String> {
         if packages.is_empty() {
             return Ok("No packages requested.".to_string());
@@ -57,17 +64,15 @@ impl PythonRuntime {
         let mut cmd = Command::new("uv");
         cmd.arg("pip")
            .arg("install")
-           .env("VIRTUAL_ENV", &self.venv_path); // Tell uv which environment to use if needed, though usually automatic if we source it, but for 'pip install' we might need to target the python executable or use -p. 
-           // Actually, 'uv pip install' needs to know the environment. simpler: use 'uv pip install -p <python_path> ...'
-        
-        // Find python executable in venv
-        let python_path = if cfg!(windows) {
-            self.venv_path.join("Scripts").join("python.exe")
-        } else {
-            self.venv_path.join("bin").join("python")
-        };
+           .arg("--quiet"); // Reduce noise
 
+        // On some platforms/uv versions, explicitly setting VIRTUAL_ENV is safest
+        cmd.env("VIRTUAL_ENV", &self.venv_path);
+        
+        // We can also point to target python explicitly to be sure
+        let python_path = self.get_python_path();
         cmd.arg("-p").arg(python_path);
+
         cmd.args(packages);
 
         let output = cmd.output().context("Failed to run `uv pip install`")?;
@@ -86,16 +91,16 @@ impl PythonRuntime {
         fs::write(&script_path, script_content).context("Failed to write temporary python script")?;
 
         // Find python executable
-        let python_path = if cfg!(windows) {
-            self.venv_path.join("Scripts").join("python.exe")
-        } else {
-            self.venv_path.join("bin").join("python")
-        };
+        let python_path = self.get_python_path();
 
         let output = Command::new(python_path)
             .arg(&script_path)
-            .output()
-            .context("Failed to execute python script")?;
+            .output();
+
+        // Cleanup temporary script
+        let _ = fs::remove_file(&script_path);
+
+        let output = output.context("Failed to execute python script")?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();

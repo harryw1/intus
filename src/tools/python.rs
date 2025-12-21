@@ -3,6 +3,7 @@ use anyhow::Result;
 use serde_json::Value;
 use std::sync::Arc;
 use crate::python::PythonRuntime;
+use regex::Regex;
 
 pub struct RunPythonTool {
     pub runtime: Arc<PythonRuntime>,
@@ -16,7 +17,8 @@ impl Tool for RunPythonTool {
     fn description(&self) -> &str {
         "USE THIS to execute Python scripts for advanced analysis, math, or complex data processing.
 The environment has internet access.
-If a script fails due to missing modules, I will attempt to install them automatically.
+You can optionally provide a list of PyPI `dependencies` to install before running the script.
+If a script fails due to missing modules, I will attempt to install them automatically, but it is better to list them explicitly.
 Returns the STDOUT and STDERR of the script."
     }
 
@@ -27,6 +29,11 @@ Returns the STDOUT and STDERR of the script."
                 "script": {
                     "type": "string",
                     "description": "The Python script to execute."
+                },
+                "dependencies": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional list of PyPI packages to install before running."
                 }
             },
             "required": ["script"]
@@ -39,24 +46,29 @@ Returns the STDOUT and STDERR of the script."
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'script' argument"))?;
 
+        // Install explicit dependencies first
+        if let Some(deps) = args.get("dependencies").and_then(|v| v.as_array()) {
+             let packages: Vec<&str> = deps.iter().filter_map(|v| v.as_str()).collect();
+             if !packages.is_empty() {
+                 self.runtime.install_packages(&packages)?;
+             }
+        }
+
         // Try running the script
         match self.runtime.run_script(script) {
             Ok(output) => {
-                 // Check if it failed with a ModuleNotFoundError in the captured stderr (which run_script returns in its success Ok string for us to see)
-                 // Wait, run_script returns a string containing stdout and optionally stderr.
-                 // It only returns Err if the command *execution* failed (e.g. python not found), not if the script exited with error code.
-                 // Actually, looking at my python.rs implementation: 
-                 // It uses `cmd.output()`. If the process runs, it returns Ok(output).
-                 // It only checks for `python_path` execution failure.
-                 // So I need to parse the output here for common missing package errors if I want auto-install.
-                 
+                 // Check if it failed with a ModuleNotFoundError in the captured stderr
                  if output.contains("ModuleNotFoundError: No module named") {
-                     // Attempt to parse package name
-                     // Format: "ModuleNotFoundError: No module named 'requests'"
-                     if let Some(start) = output.find("No module named '") {
-                         let rest = &output[start + 17..];
-                         if let Some(end) = rest.find('\'') {
-                             let package = &rest[..end];
+                     // Regex to match: ModuleNotFoundError: No module named 'requests'
+                     // or: ModuleNotFoundError: No module named 'PIL'
+                     let re = Regex::new(r"ModuleNotFoundError: No module named ['\x22](.*?)['\x22]").unwrap();
+                     
+                     if let Some(caps) = re.captures(&output) {
+                         if let Some(package_match) = caps.get(1) {
+                             let package = package_match.as_str();
+                             // Clean up package name if it has submodules (e.g., 'sklearn.model_selection' -> 'sklearn' - wait, usually we want to map this, but for now try direct install or guessing 'scikit-learn')
+                             // Mapping is hard without a database. Let's try installing exactly what it says first.
+                             
                              let install_msg = format!("(Auto-installing missing package: '{}'...)\n", package);
                              
                              // Install
@@ -69,7 +81,7 @@ Returns the STDOUT and STDERR of the script."
                                  Ok(retry_output) => return Ok(format!("{}Package installed successfully.\n\n{}", install_msg, retry_output)),
                                  Err(e) => return Err(e),
                              }
-                         }
+                        }
                      }
                  }
                  
