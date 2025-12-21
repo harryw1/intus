@@ -237,20 +237,45 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
                 mode_str, app.current_session, app.current_token_usage, app.context_token_limit
             )
         }
-    } else if let Some((status, completed, total)) = &app.pull_progress {
-         let percent = if let (Some(c), Some(t)) = (completed, total) {
-             if *t > 0 { (*c as f64 / *t as f64 * 100.0) as u16 } else { 0 }
-         } else { 0 };
-         format!(" Pulling: {} ({}%) ", status, percent)
     } else {
-        let limit = app.model_context_limit.unwrap_or(app.context_token_limit);
-        format!(
-            " {} | Session: {} | Tokens: {}/{} | F1: Help ",
-            mode_str, app.current_session, app.current_token_usage, limit
-        )
-    };
+        // Priority: Critical Health Check Failure > Pull Progress > Normal Status
+        let critical_health = app.health_status.iter().find(|s| matches!(s.status, crate::health::HealthStatus::Critical(_)));
+        
+        if let Some(fail) = critical_health {
+            if let crate::health::HealthStatus::Critical(msg) = &fail.status {
+                format!(" CRITICAL ERROR: {} - {} ", fail.name, msg)
+            } else {
+                String::new() // Should not reach here
+            }
+        } else if let Some((status, completed, total)) = &app.pull_progress {
+             let percent = if let (Some(c), Some(t)) = (completed, total) {
+                 if *t > 0 { (*c as f64 / *t as f64 * 100.0) as u16 } else { 0 }
+             } else { 0 };
+             format!(" Pulling: {} ({}%) ", status, percent)
+        } else {
+            let limit = app.model_context_limit.unwrap_or(app.context_token_limit);
+            
+            // Check warnings
+            let warning_health = app.health_status.iter().find(|s| matches!(s.status, crate::health::HealthStatus::Warning(_)));
+            let warning_text = if let Some(warn) = warning_health {
+                 if let crate::health::HealthStatus::Warning(msg) = &warn.status {
+                     format!(" | Warn: {} - {} ", warn.name, msg)
+                 } else { String::new() }
+            } else { String::new() };
 
-    let style = app.theme.status_bar();
+            format!(
+                " {} | Session: {} | Tokens: {}/{}{} | F1: Help ",
+                mode_str, app.current_session, app.current_token_usage, limit, warning_text
+            )
+        }
+    };
+    
+    // Style override for Critical
+    let style = if app.health_status.iter().any(|s| matches!(s.status, crate::health::HealthStatus::Critical(_))) {
+         Style::default().fg(Color::White).bg(Color::Red).add_modifier(Modifier::BOLD)
+    } else {
+         app.theme.status_bar()
+    };
     let p = Paragraph::new(status_text)
         .style(style)
         .alignment(ratatui::layout::Alignment::Left);

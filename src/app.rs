@@ -2,6 +2,7 @@ use crate::config::Config;
 use crate::process::ProcessTracker;
 use crate::context::ContextManager;
 use crate::ollama::{ChatMessage, ChatMessageRequest, ChatStreamEvent, OllamaClient, ToolCall};
+use reqwest;
 use crate::tools::{CatTool, GrepTool, ListDirectoryTool, ReadUrlTool, ReplaceTextTool, EditFileTool, RunCommandTool, SemanticSearchTool, Tool, WebSearchTool, WriteFileTool, MemoryTool, DeleteFileTool, SymbolSearchTool, RunPythonTool};
 use crate::python::PythonRuntime;
 use crate::persistence::SessionManager;
@@ -19,6 +20,7 @@ use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 use tui_textarea::{Input, TextArea};
 use arboard::Clipboard;
+use tracing::info;
 
 /// Generates system context information for the LLM to understand the user's environment.
 ///
@@ -156,6 +158,8 @@ pub enum Action {
     // Session Auto-Naming
     TriggerAutoNaming,
     RenameSession(String),
+    // Health
+    HealthUpdate(crate::health::ServiceStatus),
 }
 
 /// Defines the current input mode of the application.
@@ -291,6 +295,7 @@ pub struct App<'a> {
     pub location: Option<String>,
     pub enable_session_autonaming: bool,
     pub monologue_parser: Option<crate::monologue::MonologueParser>,
+    pub health_status: Vec<crate::health::ServiceStatus>,
 }
 
 impl<'a> App<'a> {
@@ -302,7 +307,7 @@ impl<'a> App<'a> {
     /// * `config` - Application configuration.
     /// * `load_history` - Whether to load the previous session history on startup.
     /// * `custom_session_path` - Optional path to a specific session file to load.
-    pub fn new(
+    pub async fn init(
         action_tx: mpsc::UnboundedSender<Action>,
         config: Config,
         load_history: bool,
@@ -313,9 +318,13 @@ impl<'a> App<'a> {
         textarea.set_cursor_line_style(Style::default());
         textarea.set_placeholder_text("Type a message...");
 
-        textarea.set_placeholder_text("Type a message...");
-
         let process_tracker = Arc::new(ProcessTracker::new());
+
+        // Initialize Ollama Client
+        let _ollama_client = OllamaClient::new(config.ollama_url.clone());
+
+        // Health Checks
+        let health_status = crate::health::check_all(&config.ollama_url, &config.searxng_url).await;
 
         let storage_path = config.get_config_dir().map(|d| d.join("memory").join("vectors.json"));
         // Ensure memory dir exists
@@ -330,12 +339,21 @@ impl<'a> App<'a> {
 
         let vector_index = Arc::new(std::sync::Mutex::new(None));
 
+        // Use async RAG init directly, blocking call is not needed anymore
         let shared_rag = Arc::new(crate::rag::RagSystem::new(
-            OllamaClient::new(config.ollama_url.clone()),
-            config.embedding_model.clone(),
-            vector_index.clone(),
-            storage_path.clone(),
+             OllamaClient::new(config.ollama_url.clone()),
+             config.embedding_model.clone(),
+             vector_index.clone(),
+             storage_path.clone(),
         ));
+        
+        // Attempt to load existing index
+        if let Err(_e) = shared_rag.load() {
+             // Log but continue? Or warn?
+             // Since we have active health checks now, we can maybe store this?
+             // Or just ignore as it might be a fresh run.
+             // e.g. "Failed to load index: {}"
+        }
 
         let mut tools: HashMap<String, Arc<dyn Tool>> = HashMap::new();
 
@@ -514,7 +532,7 @@ impl<'a> App<'a> {
             context_token_limit: config.context_token_limit,
             system_prompt: system_prompt.clone(),
             system_prompt_input: TextArea::new(vec![system_prompt]),
-            session_file_path: custom_session_path,
+            session_file_path: custom_session_path.clone(),
             current_session: "default".to_string(),
             available_sessions: Vec::new(),
             session_list_state: ratatui::widgets::ListState::default(),
@@ -556,12 +574,17 @@ impl<'a> App<'a> {
             location: config.location.clone(),
             enable_session_autonaming: config.enable_session_autonaming,
             monologue_parser: Some(crate::monologue::MonologueParser::new()),
+            health_status,
         };
 
         if load_history {
-            // Migrate old history.json if it exists and sessions/default.json doesn't
             app.migrate_legacy_history();
+            // Loading history is synchronous
             app.load_session("default");
+        } else if let Some(path) = custom_session_path {
+             if let Err(e) = app.load_session_from_file(path) {
+                 app.error = Some(format!("Failed to load session: {}", e));
+             }
         }
 
         // Trigger Geolocation if enabled and not manually set
@@ -919,7 +942,31 @@ impl<'a> App<'a> {
         self.current_token_usage = ContextManager::estimate_token_count(&self.messages);
     }
 
+    pub fn load_session_from_file(&mut self, path: PathBuf) -> Result<(), String> {
+        self.current_session = path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("custom")
+            .to_string();
+        self.messages.clear();
+        self.vertical_scroll = 0;
+        self.current_response_buffer.clear();
+        
+        if path.exists() {
+             let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
+             let messages = serde_json::from_str(&content).map_err(|e| e.to_string())?;
+             self.messages = messages;
+             if !self.messages.is_empty() {
+                 self.auto_scroll = true;
+             }
+             self.current_token_usage = ContextManager::estimate_token_count(&self.messages);
+             Ok(())
+        } else {
+             Err("File does not exist".to_string())
+        }
+    }
+
     async fn request_ai_response(&mut self) {
+        info!("RequestAiResponse triggered. Models loaded: {}", self.models.len());
         if self.models.is_empty() {
             self.error = Some("No models loaded".to_string());
             return;
@@ -962,6 +1009,7 @@ impl<'a> App<'a> {
 
         // 2. Perform Async RAG Search
         if let Some(query) = last_user_content {
+            info!("Starting RAG search for query: {}", query);
             let rag_arc = Arc::new(self.rag.clone()); // Need to clone the RagSystem? It has Arc internals, but RagSystem itself isn't Arc.
             // RagSystem fields are Arc. `client` is not Arc but is cloneable (Reqwest client is Arc internally).
             // So cloning RagSystem is cheap.
@@ -974,6 +1022,7 @@ impl<'a> App<'a> {
                 // Search all collections (None) for general chat context
                 match rag_arc.search(&query_clone, 3, None).await {
                     Ok(results) => {
+                         info!("RAG search complete. Found {} results", results.len());
                          if !results.is_empty() {
                              let context = format!("\n\n[Relevant Context from Tools]:\n{}", results.join("\n---\n"));
                              let _ = tx.send(Action::RagContextReady(Some(context)));
@@ -981,20 +1030,30 @@ impl<'a> App<'a> {
                              let _ = tx.send(Action::RagContextReady(None));
                          }
                     }
-                    Err(_) => {
+                    Err(e) => {
                         // Ignore error, proceed without context
+                        info!("RAG search failed: {}", e);
                         let _ = tx.send(Action::RagContextReady(None));
                     }
                 }
             });
         } else {
             // No user message (?), just start generation
+            info!("No user message found, skipping RAG");
             self.start_generation(None).await;
         }
     }
 
     async fn start_generation(&mut self, rag_context: Option<String>) {
         let mut context_messages = self.build_context_window();
+        
+        // Remove trailing empty assistant message if present
+        // This prevents "400 Bad Request" from Ollama
+        if let Some(last) = context_messages.last() {
+            if last.role == "assistant" && last.content.is_empty() && last.tool_calls.is_none() {
+                context_messages.pop();
+            }
+        }
         
         // Inject RAG context if available
         if let Some(ctx) = rag_context {
@@ -1020,32 +1079,54 @@ impl<'a> App<'a> {
         let context_limit = self.context_token_limit;
 
         let handle = tokio::spawn(async move {
+            info!("Generation task started. Context limit: {}", context_limit);
             let mut options = std::collections::HashMap::new();
             options.insert("num_ctx".to_string(), serde_json::json!(context_limit));
 
+            info!("Calling OllamaClient::chat...");
             match client
                 .chat(&model, context_messages, tool_definitions, Some(options))
                 .await
             {
                 Ok(mut stream) => {
+                    info!("OllamaClient::chat returned stream. Starting iteration.");
                     while let Some(result) = stream.next().await {
                         match result {
                             Ok(event) => match event {
                                 ChatStreamEvent::Token(token) => {
+                                    info!("Received token: {:?}", token); // Verbose but needed
                                     let _ = tx.send(Action::AddAiToken(token));
                                 }
                                 ChatStreamEvent::ToolCall(tool_call) => {
+                                    info!("Received tool call: {:?}", tool_call);
                                     let _ = tx.send(Action::AddToolCall(tool_call));
                                 }
                             },
                             Err(e) => {
+                                info!("Stream error: {}", e);
                                 let _ = tx.send(Action::Error(format!("Stream: {}", e)));
                             }
                         }
                     }
+                    info!("Stream finished.");
                     let _ = tx.send(Action::AiResponseComplete);
                 }
                 Err(e) => {
+                    info!("OllamaClient::chat failed: {}", e);
+                    // Check for connection error
+                    let is_connection_error = if let Some(req_err) = e.downcast_ref::<reqwest::Error>() {
+                        req_err.is_connect() || req_err.is_timeout()
+                    } else {
+                        false
+                    };
+
+                    if is_connection_error {
+                        let _ = tx.send(Action::HealthUpdate(crate::health::ServiceStatus::new(
+                            "Ollama",
+                            crate::health::HealthStatus::Critical(format!("Connection Failed: {}", e))
+                        )));
+                    }
+
                     let _ = tx.send(Action::Error(format!("Chat failed: {}", e)));
                 }
             }
@@ -1709,6 +1790,7 @@ impl<'a> App<'a> {
                 true
             }
             Action::RagContextReady(context) => {
+                info!("Action::RagContextReady received. Context present: {}", context.is_some());
                 self.start_generation(context).await;
                 true
             }
@@ -1716,6 +1798,15 @@ impl<'a> App<'a> {
                 self.location = Some(loc.clone());
                 // Optional: Notify user
                 self.notification = Some((format!("Location detected: {}", loc), std::time::Instant::now()));
+                true
+            }
+            Action::HealthUpdate(status) => {
+                // Update or add the status
+                if let Some(existing) = self.health_status.iter_mut().find(|s| s.name == status.name) {
+                    *existing = status;
+                } else {
+                    self.health_status.push(status);
+                }
                 true
             }
             Action::ShowStatus(msg) => {
@@ -1810,6 +1901,7 @@ impl<'a> App<'a> {
                                 if key.modifiers.contains(KeyModifiers::SHIFT) || key.modifiers.contains(KeyModifiers::ALT) {
                                     self.input.insert_newline();
                                 } else {
+                                    info!("Enter pressed in Insert mode, sending message");
                                     let _ = self.action_tx.send(Action::SendMessage);
                                 }
                             } else if key.code == KeyCode::Char('o')
@@ -1823,6 +1915,7 @@ impl<'a> App<'a> {
                                    let _ = self.action_tx.send(Action::CancelGeneration);
                                 }
                             } else {
+                                info!("Inserting char into TextArea: {:?}", key);
                                 self.input.input(Input::from(key));
                             }
                         }

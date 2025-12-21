@@ -53,7 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Config::new_test_config()
     });
 
-    let mut app = App::new(action_tx.clone(), config, true, None);
+    let mut app = App::init(action_tx.clone(), config, true, None).await;
 
     // Input handling task
     let input_handle = {
