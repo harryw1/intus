@@ -1,8 +1,8 @@
 class Intus < Formula
   desc "Local Autonomous Agent and System Sidecar for your terminal"
   homepage "https://github.com/harryw1/intus"
-  url "https://github.com/harryw1/intus/archive/refs/tags/v1.0.3.tar.gz"
-  sha256 "c27bd888e6afa5cad254db7cd85ed41b6a54d3362073c27cb678a681042e24ec"
+  url "https://github.com/harryw1/intus/archive/refs/tags/v1.1.0.tar.gz"
+  sha256 "1f911f079619589023772408717aeb65840e5914eb64c8431f1907444ed816c4"
   license "MIT"
   head "https://github.com/harryw1/intus.git", branch: "master"
 
