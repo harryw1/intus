@@ -43,6 +43,7 @@ async fn test_rag_end_to_end() {
     let tool = ReadUrlTool {
         client: OnceLock::new(),
         rag: rag.clone(),
+        browser: Arc::new(intus::tools::web::BrowserClient::new()),
     };
 
     // 3. Execute Tool (Fetch + Index)

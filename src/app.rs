@@ -323,6 +323,9 @@ impl<'a> App<'a> {
             }
         }
         
+        // Browser client (shared)
+        let browser_client = Arc::new(crate::tools::web::BrowserClient::new());
+
         let vector_index = Arc::new(std::sync::Mutex::new(None));
 
         let shared_rag = Arc::new(crate::rag::RagSystem::new(
@@ -408,6 +411,7 @@ impl<'a> App<'a> {
             Arc::new(ReadUrlTool {
                 client: std::sync::OnceLock::new(),
                 rag: shared_rag.clone(),
+                browser: browser_client.clone(),
             }),
         );
 

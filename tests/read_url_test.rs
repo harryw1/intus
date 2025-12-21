@@ -37,6 +37,7 @@ async fn test_read_url_fetching() {
         let tool = ReadUrlTool {
             client: OnceLock::new(),
             rag,
+            browser: Arc::new(intus::tools::web::BrowserClient::new()),
         };
 
         let args = json!({

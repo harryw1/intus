@@ -1,8 +1,9 @@
 use super::Tool;
 use anyhow::Result;
 use serde_json::Value;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Mutex};
 use crate::rag::RagSystem;
+use headless_chrome::{Browser, LaunchOptions};
 
 pub struct WebSearchTool {
     pub searxng_url: String,
@@ -136,9 +137,46 @@ IMPORTANT:
     }
 }
 
+pub struct BrowserClient {
+    browser: Mutex<Option<Browser>>,
+}
+
+impl BrowserClient {
+    pub fn new() -> Self {
+        Self {
+            browser: Mutex::new(None),
+        }
+    }
+
+    pub fn get_content(&self, url: &str) -> Result<String> {
+        let mut browser_guard = self.browser.lock().unwrap();
+        
+        if browser_guard.is_none() {
+            let browser = Browser::new(LaunchOptions {
+                headless: true,
+                ..Default::default()
+            })?;
+            *browser_guard = Some(browser);
+        }
+
+        let browser = browser_guard.as_ref().unwrap();
+        let tab = browser.new_tab()?;
+        
+        tab.navigate_to(url)?;
+        tab.wait_until_navigated()?;
+        
+        // Wait a bit for JS to execute (naive)
+        std::thread::sleep(std::time::Duration::from_millis(2000));
+
+        let content = tab.find_element("body")?.get_inner_text()?;
+        Ok(content)
+    }
+}
+
 pub struct ReadUrlTool {
     pub client: OnceLock<reqwest::blocking::Client>,
     pub rag: Arc<RagSystem>,
+    pub browser: Arc<BrowserClient>,
 }
 
 impl Tool for ReadUrlTool {
@@ -184,17 +222,50 @@ If NO query is provided, the tool returns the start of the page and INDEXES the 
                 .unwrap_or_else(|_| reqwest::blocking::Client::new())
         });
         
-        let response = client.get(url)
-            .header("User-Agent", "Mozilla/5.0 (compatible; Intus/1.0; +https://github.com/harryw1/intus)")
-            .send()?;
+        // Primary Strategy: HTTP Request (Fast)
+        // If it fails or returns little content, fallback to Browser (Slow but Robust)
+        
+        let mut text = String::new();
+        let mut needs_browser = false;
 
-        if !response.status().is_success() {
-             return Err(anyhow::anyhow!("Failed to fetch URL: {}", response.status()));
+        match client.get(url)
+            .header("User-Agent", "Mozilla/5.0 (compatible; Intus/1.0; +https://github.com/harryw1/intus)")
+            .send() 
+        {
+            Ok(response) => {
+                if response.status().is_success() {
+                    let html = response.text().unwrap_or_default();
+                    let width = 120;
+                    text = html2text::from_read(html.as_bytes(), width);
+                    
+                    // Simple heuristic: If text is too short or mentions "enable javascript", use browser
+                    if text.len() < 500 || text.to_lowercase().contains("enable javascript") || text.to_lowercase().contains("you need to enable javascript") {
+                        needs_browser = true;
+                    }
+                } else {
+                    needs_browser = true; // Fallback on error (e.g. 403 blocking naive requests)
+                }
+            },
+            Err(_) => {
+                needs_browser = true;
+            }
         }
 
-        let html = response.text()?;
-        let width = 120; 
-        let text = html2text::from_read(html.as_bytes(), width);
+        if needs_browser {
+             match self.browser.get_content(url) {
+                 Ok(browser_text) => {
+                     text = browser_text;
+                 },
+                 Err(e) => {
+                     // If browser fails, return whatever we had or the error
+                     if text.is_empty() {
+                         return Err(anyhow::anyhow!("Failed to read URL via HTTP and Browser: {}", e));
+                     }
+                     // Provide what we have with a warning
+                     text = format!("(Warning: Browser rendering failed, showing raw extraction)\n{}", text);
+                 }
+             }
+        }
         
         // Always ingest into RAG
         let handle = tokio::runtime::Handle::current();

@@ -35,6 +35,7 @@ sysinfo = "0.32"
 arboard = "3.6.1"
 ignore = "0.4"
 chrono = "0.4.42"
+headless_chrome = "1.0.20"
 
 [dev-dependencies]
 wiremock = "0.6"
