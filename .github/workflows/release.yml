@@ -49,3 +49,5 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: ${{ matrix.asset_name }}
+          make_latest: true
+          generate_release_notes: true

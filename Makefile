@@ -19,10 +19,8 @@ release: check-version
 	
 	# 3. Tag and Push
 	@git tag v$(VERSION)
-	@git tag -f latest
 	@git push origin master
 	@git push origin v$(VERSION)
-	@git push -f origin latest
 	
 	@echo "Waiting for GitHub to generate the tarball..."
 	@sleep 5
