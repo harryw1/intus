@@ -37,3 +37,4 @@ Desktop.ini
 
 # Testing artifacts
 *.profraw
+config.toml

@@ -25,12 +25,12 @@ async fn test_web_search_url_fetching() {
         let tool = WebSearchTool {
             searxng_url: "http://localhost:8080".to_string(),
             client: std::sync::OnceLock::new(),
-            rag: std::sync::Arc::new(intus::rag::RagSystem::new(
-                intus::ollama::OllamaClient::new("http://localhost".to_string()),
-                "dummy".to_string(),
-                std::sync::Arc::new(std::sync::Mutex::new(None)),
-                None,
-            )),
+    let rag = Arc::new(RagSystem::new(
+        intus::ollama::OllamaClient::new("http://localhost".to_string(), "ollama".to_string(), "".to_string()),
+        "dummy".to_string(),
+        Arc::new(Mutex::new(None)),
+        None,
+    ));
         };
 
         let args = json!({

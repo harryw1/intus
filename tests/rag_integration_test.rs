@@ -32,7 +32,7 @@ async fn test_rag_end_to_end() {
 
     // 2. Initialize Components
     let vector_index = Arc::new(Mutex::new(None));
-    let client = OllamaClient::new(mock_server.uri());
+    let client = OllamaClient::new(mock_server.uri(), "ollama".to_string(), "".to_string());
     let rag = Arc::new(RagSystem::new(
         client.clone(),
         "nomic-embed-text".to_string(),

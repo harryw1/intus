@@ -321,7 +321,7 @@ impl<'a> App<'a> {
         let process_tracker = Arc::new(ProcessTracker::new());
 
         // Initialize Ollama Client
-        let _ollama_client = OllamaClient::new(config.ollama_url.clone());
+        let _ollama_client = OllamaClient::new(config.ollama_url.clone(), config.api_type.clone(), config.api_key.clone());
 
         // Health Checks
         let health_status = crate::health::check_all(&config.ollama_url, &config.searxng_url).await;
@@ -341,7 +341,7 @@ impl<'a> App<'a> {
 
         // Use async RAG init directly, blocking call is not needed anymore
         let shared_rag = Arc::new(crate::rag::RagSystem::new(
-             OllamaClient::new(config.ollama_url.clone()),
+             OllamaClient::new(config.ollama_url.clone(), config.api_type.clone(), config.api_key.clone()),
              config.embedding_model.clone(),
              vector_index.clone(),
              storage_path.clone(),
@@ -515,7 +515,7 @@ impl<'a> App<'a> {
         }
 
         let mut app = Self {
-            ollama_client: OllamaClient::new(config.ollama_url.clone()),
+            ollama_client: OllamaClient::new(config.ollama_url.clone(), config.api_type.clone(), config.api_key.clone()),
             action_tx,
             messages: Vec::new(),
             input: textarea,
@@ -562,7 +562,7 @@ impl<'a> App<'a> {
             theme: crate::theme::Theme::default(),
             process_tracker,
             rag: crate::rag::RagSystem::new(
-                OllamaClient::new(config.ollama_url.clone()),
+                OllamaClient::new(config.ollama_url.clone(), config.api_type.clone(), config.api_key.clone()),
                 config.embedding_model.clone(),
                 vector_index.clone(),
                 storage_path,

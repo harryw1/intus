@@ -22,7 +22,7 @@ async fn test_rag_persistence() {
         .mount(&mock_server)
         .await;
 
-    let client = OllamaClient::new(mock_server.uri());
+    let client = OllamaClient::new(mock_server.uri(), "ollama".to_string(), "".to_string());
     
     // 1. Create first system and add text
     {

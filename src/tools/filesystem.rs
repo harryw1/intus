@@ -740,7 +740,7 @@ mod tests {
         let tool = Arc::new(CatTool {
             ignored_patterns: vec![],
             rag: Arc::new(crate::rag::RagSystem::new(
-                OllamaClient::new("http://localhost".to_string()),
+                OllamaClient::new("http://localhost".to_string(), "ollama".to_string(), "".to_string()),
                 "dummy".to_string(),
                 Arc::new(Mutex::new(None)),
                 None,

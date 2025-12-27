@@ -1,13 +1,18 @@
 use anyhow::Result;
 use directories::{BaseDirs, ProjectDirs};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use tracing::{info, warn};
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Config {
     #[serde(default = "default_ollama_url")]
     pub ollama_url: String,
+    #[serde(default = "default_api_type")]
+    pub api_type: String, // "ollama" or "openai"
+    #[serde(default)]
+    pub api_key: String,
     #[serde(default = "default_context_token_limit")]
     pub context_token_limit: usize,
     #[serde(default = "default_system_prompt")]
@@ -49,6 +54,10 @@ fn default_enable_session_autonaming() -> bool {
 
 fn default_ollama_url() -> String {
     "http://localhost:11434".to_string()
+}
+
+fn default_api_type() -> String {
+    "ollama".to_string()
 }
 
 fn default_enable_geolocation() -> bool {
@@ -174,6 +183,15 @@ impl Config {
     ///
     /// If the file does not exist, default settings are returned.
     pub fn load() -> Result<Self> {
+        // First check for config.toml in the current directory
+        let local_config_path = std::path::Path::new("config.toml");
+        if local_config_path.exists() {
+            info!("Loading configuration from local ./config.toml");
+            let contents = fs::read_to_string(local_config_path)?;
+            let config: Config = toml::from_str(&contents)?;
+            return Ok(config);
+        }
+
         let config_path = if cfg!(target_os = "macos") || cfg!(target_os = "linux") {
             // Force ~/.config/intus/config.toml for macOS and Linux
             BaseDirs::new().map(|base| {
@@ -188,17 +206,22 @@ impl Config {
                 .map(|proj_dirs| proj_dirs.config_dir().join("config.toml"))
         };
 
-        if let Some(path) = config_path {
+        if let Some(path) = &config_path {
             if path.exists() {
-                let contents = fs::read_to_string(&path)?;
+                info!("Loading configuration from {:?}", path);
+                let contents = fs::read_to_string(path)?;
                 let config: Config = toml::from_str(&contents)?;
                 return Ok(config);
             }
         }
 
+        info!("Configuration file not found. Using defaults.");
+
         // Return default if file doesn't exist or directories fails
-        Ok(Config {
+        let default_config = Config {
             ollama_url: default_ollama_url(),
+            api_type: default_api_type(),
+            api_key: String::new(),
             context_token_limit: default_context_token_limit(),
             system_prompt: default_system_prompt(),
             ignored_patterns: default_ignored_patterns(),
@@ -213,7 +236,27 @@ impl Config {
             enable_geolocation: default_enable_geolocation(),
             knowledge_bases: default_knowledge_bases(),
             enable_session_autonaming: default_enable_session_autonaming(),
-        })
+        };
+
+        // Try to save the default config
+        if let Some(path) = &config_path {
+            if let Some(parent) = path.parent() {
+                match fs::create_dir_all(parent) {
+                    Ok(_) => {
+                        if let Ok(toml_string) = toml::to_string_pretty(&default_config) {
+                             if let Ok(_) = fs::write(path, toml_string) {
+                                 info!("Created default configuration file at {:?}", path);
+                             }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to create configuration directory: {}", e);
+                    }
+                }
+            }
+        }
+
+        Ok(default_config)
     }
 
     /// Returns the path to the application's configuration directory.
@@ -233,6 +276,8 @@ impl Config {
     pub fn new_test_config() -> Self {
         Self {
             ollama_url: default_ollama_url(),
+            api_type: default_api_type(),
+            api_key: String::new(),
             context_token_limit: 4096,
             system_prompt: "You are helpful".to_string(),
             ignored_patterns: vec![],

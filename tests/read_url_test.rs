@@ -27,13 +27,12 @@ async fn test_read_url_fetching() {
     // We wrap execution in spawn_blocking because ReadUrlTool uses reqwest::blocking
     // and we are in an async runtime.
     let result = tokio::task::spawn_blocking(move || {
-        let rag = Arc::new(RagSystem::new(
-            OllamaClient::new("http://localhost".to_string()),
-            "dummy_model".to_string(),
-            Arc::new(Mutex::new(None)),
-            None
-        ));
-
+            let rag = Arc::new(RagSystem::new(
+                OllamaClient::new("http://localhost".to_string(), "ollama".to_string(), "".to_string()),
+                "dummy".to_string(),
+                Arc::new(Mutex::new(None)),
+                None,
+            ));
         let tool = ReadUrlTool {
             client: OnceLock::new(),
             rag,

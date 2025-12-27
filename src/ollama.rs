@@ -12,6 +12,9 @@ use std::time::Duration;
 pub struct OllamaClient {
     client: Client,
     base_url: String,
+    api_type: String, // "ollama" or "openai"
+    #[allow(dead_code)]
+    api_key: String,
 }
 
 /// Represents a single message in the chat history.
@@ -74,8 +77,35 @@ struct ChatMessageResponse {
 }
 
 #[derive(Deserialize)]
+struct OpenAiChatChunk {
+    choices: Vec<OpenAiChoice>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiChoice {
+    delta: OpenAiDelta,
+}
+
+#[derive(Deserialize)]
+struct OpenAiDelta {
+    content: Option<String>,
+    tool_calls: Option<Vec<ToolCall>>,
+}
+
+
+#[derive(Deserialize)]
 struct ModelsResponse {
     models: Vec<Model>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiModelsResponse {
+    data: Vec<OpenAiModel>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiModel {
+    id: String,
 }
 
 #[derive(Deserialize)]
@@ -207,28 +237,51 @@ impl OllamaClient {
     ///
     /// # Arguments
     ///
-    /// * `base_url` - The base URL of the Ollama API (e.g., "http://localhost:11434").
-    pub fn new(base_url: String) -> Self {
+    /// * `base_url` - The base URL of the API (e.g., "http://localhost:11434" or "http://localhost:1234").
+    /// * `api_type` - The type of API ("ollama" or "openai").
+    /// * `api_key` - Optional API key (mostly for OpenAI-compatible endpoints).
+    pub fn new(base_url: String, api_type: String, api_key: String) -> Self {
+        let mut headers = reqwest::header::HeaderMap::new();
+        if !api_key.is_empty() {
+             if let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", api_key)) {
+                 headers.insert(reqwest::header::AUTHORIZATION, val);
+             }
+        }
+
         Self {
             client: Client::builder()
+                .default_headers(headers)
                 .timeout(Duration::from_secs(3600)) // 1 hour timeout
                 .build()
                 .unwrap_or_else(|_| Client::new()),
             base_url,
+            api_type,
+            api_key,
         }
     }
 
     /// Lists all locally available models.
     pub async fn list_models(&self) -> Result<Vec<String>> {
-        let response = self
-            .client
-            .get(&format!("{}/api/tags", self.base_url))
-            .send()
-            .await?
-            .json::<ModelsResponse>()
-            .await?;
+        if self.api_type == "openai" {
+            let response = self
+                .client
+                .get(&format!("{}/v1/models", self.base_url))
+                .send()
+                .await?
+                .json::<OpenAiModelsResponse>()
+                .await?;
+            Ok(response.data.into_iter().map(|m| m.id).collect())
+        } else {
+            let response = self
+                .client
+                .get(&format!("{}/api/tags", self.base_url))
+                .send()
+                .await?
+                .json::<ModelsResponse>()
+                .await?;
 
-        Ok(response.models.into_iter().map(|m| m.name).collect())
+            Ok(response.models.into_iter().map(|m| m.name).collect())
+        }
     }
 
     /// Deletes a model from the local storage.
@@ -365,94 +418,167 @@ impl OllamaClient {
         tools: Option<Vec<ToolDefinition>>,
         options: Option<HashMap<String, Value>>,
     ) -> Result<impl Stream<Item = Result<ChatStreamEvent, anyhow::Error>>> {
-        let mut request_options = HashMap::new();
-        request_options.insert("num_predict".to_string(), serde_json::json!(-1)); // -1 = Infinite generation
-        
-        if let Some(opts) = options {
-            request_options.extend(opts);
-        }
-
-        let request = ChatRequest {
-            model: model.to_string(),
-            messages,
-            stream: true,
-            options: Some(request_options),
-            tools,
-        };
-
-        let response = self
-            .client
-            .post(&format!("{}/api/chat", self.base_url))
-            .json(&request)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            return Err(anyhow::anyhow!(
-                "Request failed with status: {}",
-                response.status()
-            ));
-        }
-
-        let stream = response.bytes_stream();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let client = self.client.clone();
+        
+        if self.api_type == "openai" {
+            let url = format!("{}/v1/chat/completions", self.base_url);
+            
+            // Build OpenAI Request
+            let mut request_body = serde_json::Map::new();
+            request_body.insert("model".to_string(), serde_json::json!(model));
+            request_body.insert("messages".to_string(), serde_json::to_value(&messages)?);
+            request_body.insert("stream".to_string(), serde_json::json!(true));
+            if let Some(t) = tools {
+                request_body.insert("tools".to_string(), serde_json::to_value(t)?);
+            }
+            
+            // Unpack options into top-level
+            if let Some(opts) = options {
+                for (k, v) in opts {
+                    request_body.insert(k, v);
+                }
+            }
+            
+            let response = client.post(&url).json(&request_body).send().await?;
+             if !response.status().is_success() {
+                return Err(anyhow::anyhow!("Request failed: {}", response.status()));
+            }
 
-        tokio::spawn(async move {
-            let mut stream = stream;
-            let mut buffer = Vec::new();
+            let stream = response.bytes_stream();
+            
+            tokio::spawn(async move {
+                let mut stream = stream;
+                let mut buffer = Vec::new();
 
-            while let Some(chunk_result) = stream.next().await {
-                match chunk_result {
-                    Ok(bytes) => {
-                        buffer.extend_from_slice(&bytes);
+                while let Some(chunk_result) = stream.next().await {
+                     match chunk_result {
+                        Ok(bytes) => {
+                             buffer.extend_from_slice(&bytes);
+                             while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
+                                  let line_bytes: Vec<u8> = buffer.drain(..=pos).collect();
+                                  let line = String::from_utf8_lossy(&line_bytes).trim().to_string();
+                                  
+                                  if line.starts_with("data: ") {
+                                      let data = &line[6..];
+                                      if data == "[DONE]" {
+                                          continue;
+                                      }
+                                      if let Ok(chunk) = serde_json::from_str::<OpenAiChatChunk>(data) {
+                                           if let Some(choice) = chunk.choices.first() {
+                                               if let Some(content) = &choice.delta.content {
+                                                   if !content.is_empty() {
+                                                       let _ = tx.send(Ok(ChatStreamEvent::Token(content.clone())));
+                                                   }
+                                               }
+                                               if let Some(tool_calls) = &choice.delta.tool_calls {
+                                                   for call in tool_calls {
+                                                       let _ = tx.send(Ok(ChatStreamEvent::ToolCall(call.clone())));
+                                                   }
+                                               }
+                                           }
+                                      }
+                                  }
+                             }
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(anyhow::anyhow!("Chunk error: {}", e)));
+                            return;
+                        }
+                     }
+                }
+            });
 
-                        // Process buffer for newlines
-                        while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
-                            let line_bytes: Vec<u8> = buffer.drain(..=pos).collect();
-                            let s = String::from_utf8_lossy(&line_bytes);
-                            if let Ok(json) = serde_json::from_str::<ChatResponse>(&s) {
-                                // Emit Token if content exists
-                                if !json.message.content.is_empty() {
-                                    if let Err(_) =
-                                        tx.send(Ok(ChatStreamEvent::Token(json.message.content)))
-                                    {
-                                        return;
-                                    }
-                                }
-                                // Emit ToolCall if exists
-                                if let Some(calls) = json.message.tool_calls {
-                                    for call in calls {
-                                        if let Err(_) = tx.send(Ok(ChatStreamEvent::ToolCall(call)))
+        } else {
+            // Ollama Implementation
+            let mut request_options = HashMap::new();
+            request_options.insert("num_predict".to_string(), serde_json::json!(-1)); // -1 = Infinite generation
+            
+            if let Some(opts) = options {
+                request_options.extend(opts);
+            }
+
+            let request = ChatRequest {
+                model: model.to_string(),
+                messages,
+                stream: true,
+                options: Some(request_options),
+                tools,
+            };
+
+            let response = self
+                .client
+                .post(&format!("{}/api/chat", self.base_url))
+                .json(&request)
+                .send()
+                .await?;
+
+            if !response.status().is_success() {
+                return Err(anyhow::anyhow!(
+                    "Request failed with status: {}",
+                    response.status()
+                ));
+            }
+
+            let stream = response.bytes_stream();
+
+            tokio::spawn(async move {
+                let mut stream = stream;
+                let mut buffer = Vec::new();
+
+                while let Some(chunk_result) = stream.next().await {
+                    match chunk_result {
+                        Ok(bytes) => {
+                            buffer.extend_from_slice(&bytes);
+
+                            // Process buffer for newlines
+                            while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
+                                let line_bytes: Vec<u8> = buffer.drain(..=pos).collect();
+                                let s = String::from_utf8_lossy(&line_bytes);
+                                if let Ok(json) = serde_json::from_str::<ChatResponse>(&s) {
+                                    // Emit Token if content exists
+                                    if !json.message.content.is_empty() {
+                                        if let Err(_) =
+                                            tx.send(Ok(ChatStreamEvent::Token(json.message.content)))
                                         {
                                             return;
+                                        }
+                                    }
+                                    // Emit ToolCall if exists
+                                    if let Some(calls) = json.message.tool_calls {
+                                        for call in calls {
+                                            if let Err(_) = tx.send(Ok(ChatStreamEvent::ToolCall(call)))
+                                            {
+                                                return;
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Err(anyhow::anyhow!("Chunk error: {}", e)));
-                        return;
-                    }
-                }
-            }
-
-            // Process any remaining buffer
-            if !buffer.is_empty() {
-                let s = String::from_utf8_lossy(&buffer);
-                if let Ok(json) = serde_json::from_str::<ChatResponse>(&s) {
-                    if !json.message.content.is_empty() {
-                        let _ = tx.send(Ok(ChatStreamEvent::Token(json.message.content)));
-                    }
-                    if let Some(calls) = json.message.tool_calls {
-                        for call in calls {
-                            let _ = tx.send(Ok(ChatStreamEvent::ToolCall(call)));
+                        Err(e) => {
+                            let _ = tx.send(Err(anyhow::anyhow!("Chunk error: {}", e)));
+                            return;
                         }
                     }
                 }
-            }
-        });
+
+                // Process any remaining buffer
+                if !buffer.is_empty() {
+                    let s = String::from_utf8_lossy(&buffer);
+                    if let Ok(json) = serde_json::from_str::<ChatResponse>(&s) {
+                        if !json.message.content.is_empty() {
+                            let _ = tx.send(Ok(ChatStreamEvent::Token(json.message.content)));
+                        }
+                        if let Some(calls) = json.message.tool_calls {
+                            for call in calls {
+                                let _ = tx.send(Ok(ChatStreamEvent::ToolCall(call)));
+                            }
+                        }
+                    }
+                }
+            });
+        }
 
         // Convert receiver to stream
         let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
@@ -502,14 +628,14 @@ mod tests {
 
     #[test]
     fn test_client_creation() {
-        let client = OllamaClient::new("http://localhost:11434".to_string());
+        let client = OllamaClient::new("http://localhost:11434".to_string(), "ollama".to_string(), "".to_string());
         assert_eq!(client.base_url, "http://localhost:11434");
     }
 
     #[tokio::test]
     async fn test_list_models_success() {
         let mock_server = MockServer::start().await;
-        let client = OllamaClient::new(mock_server.uri());
+        let client = OllamaClient::new(mock_server.uri(), "ollama".to_string(), "".to_string());
 
         let mock_response = json!({
             "models": [
@@ -533,7 +659,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_models_error() {
         let mock_server = MockServer::start().await;
-        let client = OllamaClient::new(mock_server.uri());
+        let client = OllamaClient::new(mock_server.uri(), "ollama".to_string(), "".to_string());
 
         Mock::given(method("GET"))
             .and(path("/api/tags"))
@@ -548,7 +674,7 @@ mod tests {
     #[tokio::test]
     async fn test_chat_stream_success() {
         let mock_server = MockServer::start().await;
-        let client = OllamaClient::new(mock_server.uri());
+        let client = OllamaClient::new(mock_server.uri(), "ollama".to_string(), "".to_string());
 
         // We can simulate a stream by just returning a body,
         // because reqwest stream will just read it.
@@ -593,7 +719,7 @@ mod tests {
     #[tokio::test]
     async fn test_chat_error() {
         let mock_server = MockServer::start().await;
-        let client = OllamaClient::new(mock_server.uri());
+        let client = OllamaClient::new(mock_server.uri(), "ollama".to_string(), "".to_string());
 
         Mock::given(method("POST"))
             .and(path("/api/chat"))
@@ -616,7 +742,7 @@ mod tests {
     #[tokio::test]
     async fn test_show_model_returns_context_length() {
         let mock_server = MockServer::start().await;
-        let client = OllamaClient::new(mock_server.uri());
+        let client = OllamaClient::new(mock_server.uri(), "ollama".to_string(), "".to_string());
 
         let mock_response = json!({
             "modelfile": "FROM llama2",
@@ -657,7 +783,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_running_models() {
         let mock_server = MockServer::start().await;
-        let client = OllamaClient::new(mock_server.uri());
+        let client = OllamaClient::new(mock_server.uri(), "ollama".to_string(), "".to_string());
 
         let mock_response = json!({
             "models": [
