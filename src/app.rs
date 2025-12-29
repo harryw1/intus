@@ -430,6 +430,7 @@ impl<'a> App<'a> {
                 searxng_url: config.searxng_url.clone(),
                 client: std::sync::OnceLock::new(),
                 rag: shared_rag.clone(),
+                browser: browser_client.clone(),
             }),
         );
         tools.insert(
@@ -696,6 +697,7 @@ impl<'a> App<'a> {
                         images: None,
                         tool_calls: None,
                         tool_name: None,
+                        tool_call_id: None,
                     },
                     ChatMessageRequest {
                         role: "user".to_string(),
@@ -703,6 +705,7 @@ impl<'a> App<'a> {
                         images: None,
                         tool_calls: None,
                         tool_name: None,
+                        tool_call_id: None,
                     }
                 ];
                 
@@ -784,6 +787,7 @@ impl<'a> App<'a> {
                 images: msg.images.clone(),
                 tool_calls: msg.tool_calls.clone(),
                 tool_name: msg.tool_name.clone(),
+                tool_call_id: msg.tool_call_id.clone(),
             });
             current_tokens += msg_tokens;
         }
@@ -799,7 +803,7 @@ impl<'a> App<'a> {
                 images: None,
                 tool_calls: None,
                 tool_name: None,
-
+                tool_call_id: None,
             });
         }
 
@@ -813,7 +817,7 @@ impl<'a> App<'a> {
                 images: None,
                 tool_calls: None,
                 tool_name: None,
-
+                tool_call_id: None,
             },
         );
 
@@ -982,6 +986,7 @@ impl<'a> App<'a> {
                     images: None,
                     tool_calls: None,
                     tool_name: None,
+                    tool_call_id: None,
                     thought: None,
                 });
                 self.current_response_buffer.clear();
@@ -995,6 +1000,7 @@ impl<'a> App<'a> {
                 images: None,
                 tool_calls: None,
                 tool_name: None,
+                tool_call_id: None,
                 thought: None,
             });
             self.current_response_buffer.clear();
@@ -1168,6 +1174,7 @@ impl<'a> App<'a> {
                     images: None,
                     tool_calls: None,
                     tool_name: None,
+                    tool_call_id: None,
                     thought: None,
                 });
                 self.loading = true;
@@ -1259,11 +1266,87 @@ impl<'a> App<'a> {
                     }
                  }
 
+                // HEURISTIC: Check for embedded JSON tool calls (common in open-weights models)
+                // Pattern: {"tool":"name","arguments":{...}}
+                let mut found_embedded_tool = false;
+                if let Some(last) = self.messages.last_mut() {
+                    if last.role == "assistant" && last.tool_calls.is_none() {
+                        // Simple scan for the pattern
+                        if let Some(start_idx) = last.content.find("{\"tool\"") {
+                            // Try to parse from this point to the end or finding a matching brace
+                            // Simple approach: check if the string from start_idx is valid JSON or contains valid JSON
+                            // We scan for the matching closing brace.
+                             let potential_json = &last.content[start_idx..];
+                             // Check if it parses as our expected structure
+                             #[derive(serde::Deserialize)]
+                             struct EmbeddedTool {
+                                 tool: String,
+                                 arguments: serde_json::Value,
+                             }
+                             
+                             // Try parsing the whole tail, or substrings
+                             // Naive brace counting
+                             let mut open = 0;
+                             let mut end_idx = 0;
+                             let mut found_end = false;
+                             for (i, c) in potential_json.char_indices() {
+                                 if c == '{' { open += 1; }
+                                 if c == '}' { open -= 1; }
+                                 if open == 0 && i > 0 {
+                                     end_idx = i + 1;
+                                     found_end = true;
+                                     break;
+                                 }
+                             }
+                             
+                             if found_end {
+                                 let json_str = &potential_json[..end_idx];
+                                 if let Ok(tool_obj) = serde_json::from_str::<EmbeddedTool>(json_str) {
+                                     // Found one!
+                                     info!("Recovered embedded tool call: {} {:?}", tool_obj.tool, tool_obj.arguments);
+                                     
+                                     // Create the ToolCall
+                                     let tc = crate::ollama::ToolCall {
+                                         id: None,
+                                         type_: "function".to_string(),
+                                         function: crate::ollama::ToolCallFunction {
+                                             name: tool_obj.tool,
+                                             arguments: tool_obj.arguments,
+                                         }
+                                     };
+                                     
+                                     // Add to message
+                                     last.tool_calls = Some(vec![tc.clone()]);
+                                     
+                                     // Clean up content? 
+                                     // Usually better to keep it visible or strip it. 
+                                     // Let's strip the JSON part to avoid confusion, or keep it if it was part of text.
+                                     // User preference. For now, let's keep it but mark we found it.
+                                     // Actually, if we act on it, we should probably add the UI element "Tool Call: ..."
+                                     // The standard logic in AddToolCall handles the UI feedback.
+                                     // Since we are in ResponseComplete, we need to trigger AddToolCall manually?
+                                     // No, AddToolCall is for *streaming* or *new* calls.
+                                     // Here we just modified the message state.
+                                     // We need to trigger the tool execution.
+                                     
+                                     // We can't easily call "AddToolCall" action from here without cloning tc and sending action.
+                                     // But we are mutable here.
+                                     
+                                     // Let's trigger the action to handle execution logic (consecutive count, confirmation, etc)
+                                     let _ = self.action_tx.send(Action::AddToolCall(tc));
+                                     found_embedded_tool = true;
+                                 }
+                             }
+                        }
+                    }
+                }
+
                 self.loading = false;
                 self.save_session();
                 
                 // Auto-Rename Session if it's the first exchange in "default"
-                if self.enable_session_autonaming 
+                if !found_embedded_tool
+                   && self.enable_session_autonaming 
                    && self.current_session == "default" 
                    && self.messages.len() <= 2 // 1 user, 1 assistant (approx)
                    && !self.messages.is_empty()
@@ -1455,12 +1538,22 @@ impl<'a> App<'a> {
                     let _ = rag_clone.add_text(&output_clone, Some("default".to_string())).await;
                 });
 
+                // Find matching tool call id from last assistant message
+                let tool_call_id = self.messages.iter().rev()
+                    .find(|m| m.role == "assistant" && m.tool_calls.is_some())
+                    .and_then(|m| {
+                        m.tool_calls.as_ref().and_then(|calls| {
+                            calls.iter().find(|c| c.function.name == name).and_then(|c| c.id.clone())
+                        })
+                    });
+
                 self.messages.push(ChatMessage {
                     role: "tool".to_string(),
                     content: output,
                     images: None,
                     tool_calls: None,
                     tool_name: Some(name),
+                    tool_call_id,
                     thought: None,
                 });
                 let _ = self.action_tx.send(Action::RequestAiResponse);
@@ -1562,6 +1655,7 @@ impl<'a> App<'a> {
                         images: None,
                         tool_calls: None,
                         tool_name: None,
+                        tool_call_id: m.tool_call_id.clone(),
                     }).collect::<Vec<_>>();
                     
                     context.push(ChatMessageRequest {
@@ -1570,6 +1664,7 @@ impl<'a> App<'a> {
                         images: None,
                         tool_calls: None,
                         tool_name: None,
+                        tool_call_id: None,
                     });
 
                     // We use a separate non-streaming request or just stream and buffer
@@ -2110,7 +2205,7 @@ mod tests {
     async fn test_app_initialization() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let config = Config::new_test_config();
-        let app = App::new(tx, config, false, None);
+        let app = App::init(tx, config, false, None).await;
 
         assert!(app.messages.is_empty());
         assert_eq!(app.mode, Mode::Insert);
@@ -2121,7 +2216,7 @@ mod tests {
     async fn test_add_user_message() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let config = Config::new_test_config();
-        let mut app = App::new(tx, config, false, None);
+        let mut app = App::init(tx, config, false, None).await;
         app.models = vec!["test-model".to_string()]; // Mock models
 
         app.update(Action::AddUserMessage("Hello".to_string()))
@@ -2143,7 +2238,7 @@ mod tests {
     async fn test_models_loaded() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let config = Config::new_test_config();
-        let mut app = App::new(tx, config, false, None);
+        let mut app = App::init(tx, config, false, None).await;
 
         let models = vec!["model1".to_string(), "model2".to_string()];
         app.update(Action::ModelsLoaded(models.clone())).await;
@@ -2156,7 +2251,7 @@ mod tests {
     async fn test_user_typing() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let config = Config::new_test_config();
-        let mut app = App::new(tx, config, false, None);
+        let mut app = App::init(tx, config, false, None).await;
 
         // Type 'a'
         let key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty());
@@ -2169,7 +2264,7 @@ mod tests {
     async fn test_scroll_logic() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let config = Config::new_test_config();
-        let mut app = App::new(tx, config, false, None);
+        let mut app = App::init(tx, config, false, None).await;
 
         app.vertical_scroll = 10;
         app.update(Action::Scroll(-1)).await;
@@ -2183,7 +2278,7 @@ mod tests {
     async fn test_error_handling() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let config = Config::new_test_config();
-        let mut app = App::new(tx, config, false, None);
+        let mut app = App::init(tx, config, false, None).await;
 
         app.update(Action::Error("Connection failed".to_string()))
             .await;
@@ -2195,7 +2290,7 @@ mod tests {
     async fn test_model_select_toggle() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let config = Config::new_test_config();
-        let mut app = App::new(tx, config, false, None);
+        let mut app = App::init(tx, config, false, None).await;
 
         app.update(Action::EnterModelSelect).await;
         assert_eq!(app.mode, Mode::ModelSelect);
@@ -2218,7 +2313,7 @@ mod tests {
     async fn test_help_menu_toggle() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let config = Config::new_test_config();
-        let mut app = App::new(tx, config, false, None);
+        let mut app = App::init(tx, config, false, None).await;
 
         // Open with F1
         app.update(Action::UserInput(KeyEvent::new(
@@ -2273,7 +2368,7 @@ mod tests {
     async fn test_loading_stays_true_during_stream() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let config = Config::new_test_config();
-        let mut app = App::new(tx, config, false, None);
+        let mut app = App::init(tx, config, false, None).await;
         app.models = vec!["test".to_string()];
 
         // Simulate user message sending
@@ -2297,7 +2392,7 @@ mod tests {
     async fn test_ctrl_o_enters_model_select() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let config = Config::new_test_config();
-        let mut app = App::new(tx, config, false, None);
+        let mut app = App::init(tx, config, false, None).await;
 
         // Press Ctrl+o
         let key = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
@@ -2315,7 +2410,7 @@ mod tests {
     async fn test_add_tool_call() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let config = Config::new_test_config();
-        let mut app = App::new(tx, config, false, None);
+        let mut app = App::init(tx, config, false, None).await;
 
         // Setup conversation state
         app.messages.push(ChatMessage {
@@ -2324,10 +2419,13 @@ mod tests {
             images: None,
             tool_calls: None,
             tool_name: None,
+            tool_call_id: None,
             thought: None,
         });
 
         let tool_call = ToolCall {
+            id: None,
+            type_: "function".to_string(),
             function: crate::ollama::ToolCallFunction {
                 name: "find_files".to_string(),
                 arguments: serde_json::json!({"name": "test"}),
@@ -2357,7 +2455,7 @@ mod tests {
         let mut config = Config::new_test_config();
         config.context_token_limit = 2048;
         config.system_prompt = "HI".to_string();
-        let mut app = App::new(tx, config, false, None);
+        let mut app = App::init(tx, config, false, None).await;
 
         // Add a huge message that won't fit in the remaining space
         // Limit 2048 - 512 (buffer) - ~100 (system) = ~1400 available.
@@ -2369,6 +2467,7 @@ mod tests {
             images: None,
             tool_calls: None,
             tool_name: None,
+            tool_call_id: None,
             thought: None,
         });
 
@@ -2379,6 +2478,7 @@ mod tests {
             images: None,
             tool_calls: None,
             tool_name: None,
+            tool_call_id: None,
             thought: None,
         });
 
@@ -2395,7 +2495,7 @@ mod tests {
     async fn test_cancel_generation() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let config = Config::new_test_config();
-        let mut app = App::new(tx, config, false, None);
+        let mut app = App::init(tx, config, false, None).await;
 
         app.loading = true;
         
@@ -2411,6 +2511,7 @@ mod tests {
             images: None,
             tool_calls: None,
             tool_name: None,
+            tool_call_id: None,
             thought: None,
         });
 
@@ -2426,10 +2527,10 @@ mod tests {
     async fn test_move_selection() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let config = Config::new_test_config();
-        let mut app = App::new(tx, config, false, None);
+        let mut app = App::init(tx, config, false, None).await;
         
-        app.messages.push(ChatMessage { role: "user".to_string(), content: "1".to_string(), images: None, tool_calls: None, tool_name: None, thought: None });
-        app.messages.push(ChatMessage { role: "assistant".to_string(), content: "2".to_string(), images: None, tool_calls: None, tool_name: None, thought: None });
+        app.messages.push(ChatMessage { role: "user".to_string(), content: "1".to_string(), images: None, tool_calls: None, tool_name: None, tool_call_id: None, thought: None });
+        app.messages.push(ChatMessage { role: "assistant".to_string(), content: "2".to_string(), images: None, tool_calls: None, tool_name: None, tool_call_id: None, thought: None });
 
         assert_eq!(app.selected_message_index, None);
 
@@ -2454,9 +2555,9 @@ mod tests {
     async fn test_copy_notification_and_unselect() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let config = Config::new_test_config();
-        let mut app = App::new(tx, config, false, None);
+        let mut app = App::init(tx, config, false, None).await;
         
-        let msg = ChatMessage { role: "assistant".to_string(), content: "test".to_string(), images: None, tool_calls: None, tool_name: None, thought: None };
+        let msg = ChatMessage { role: "assistant".to_string(), content: "test".to_string(), images: None, tool_calls: None, tool_name: None, tool_call_id: None, thought: None };
         app.messages.push(msg);
         app.selected_message_index = Some(0);
 
@@ -2475,7 +2576,7 @@ mod tests {
     async fn test_cancel_in_normal_mode() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let config = Config::new_test_config();
-        let mut app = App::new(tx, config, false, None);
+        let mut app = App::init(tx, config, false, None).await;
 
         app.loading = true;
         app.mode = Mode::Normal;
@@ -2515,7 +2616,7 @@ mod tests {
     async fn test_tool_execution_throbber_state() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let config = Config::new_test_config();
-        let mut app = App::new(tx, config, false, None);
+        let mut app = App::init(tx, config, false, None).await;
 
         // Pre-condition: Must have an assistant message to attach tool call to
         app.messages.push(crate::ollama::ChatMessage {
@@ -2524,11 +2625,14 @@ mod tests {
             images: None,
             tool_calls: None,
             tool_name: None,
+            tool_call_id: None,
             thought: None,
         });
 
         // 1. Add Tool Call -> Should set is_tool_executing = true
         let tool_call = ToolCall {
+            id: None,
+            type_: "function".to_string(),
             function: crate::ollama::ToolCallFunction {
                 name: "list_directory".to_string(),
                 arguments: serde_json::json!({"path": "."}),

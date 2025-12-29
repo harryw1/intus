@@ -52,13 +52,20 @@ pub fn expand_path(path: &str) -> String {
     }
 }
 
+/// Represents a chunk of text indexed for semantic search.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct TextChunk {
+    /// The path of the file containing this chunk.
     pub file_path: String,
+    /// The actual text content of the chunk.
     pub content: String,
+    /// The starting line number in the source file.
     pub start_line: usize,
+    /// The ending line number in the source file.
     pub end_line: usize,
+    /// The vector embedding of the content.
     pub embedding: Vec<f64>,
+    /// The collection name (e.g., "work", "default") this chunk belongs to.
     #[serde(default = "default_collection")]
     pub collection: String,
 }
@@ -67,9 +74,12 @@ fn default_collection() -> String {
     "default".to_string()
 }
 
+/// Represents the persistent storage of vector embeddings.
 #[derive(Serialize, Deserialize)]
 pub struct VectorIndex {
+    /// List of all indexed text chunks.
     pub chunks: Vec<TextChunk>,
+    /// Timestamp of the last index update.
     pub indexed_at: std::time::SystemTime,
 }
 

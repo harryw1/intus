@@ -4,11 +4,21 @@ use serde_json::Value;
 use std::sync::{Arc, OnceLock, Mutex};
 use crate::rag::RagSystem;
 use headless_chrome::{Browser, LaunchOptions};
+use rand::prelude::IndexedRandom;
+
+const USER_AGENTS: &[&str] = &[
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:124.0) Gecko/20100101 Firefox/124.0",
+];
 
 pub struct WebSearchTool {
     pub searxng_url: String,
     pub client: OnceLock<reqwest::blocking::Client>,
     pub rag: Arc<RagSystem>,
+    pub browser: Arc<BrowserClient>,
 }
 
 impl Tool for WebSearchTool {
@@ -59,11 +69,24 @@ IMPORTANT:
                 .unwrap_or_else(|_| reqwest::blocking::Client::new())
         });
         
+        let user_agent = USER_AGENTS.choose(&mut rand::rng()).unwrap_or(&USER_AGENTS[0]);
+
         // Fix: usage of filter to ignore empty strings which cause builder errors
         if let Some(url) = url_arg.filter(|u| !u.is_empty()) {
              let response = client.get(url)
-                 .header("User-Agent", "Mozilla/5.0 (compatible; Intus/1.0; +https://github.com/harryw1/intus)")
+                 .header("User-Agent", *user_agent)
                  .send()?;
+            
+            if response.status().as_u16() == 403 || response.status().as_u16() == 429 {
+                // Fallback to browser for direct URL access
+                return self.browser.get_content(url).map(|text| {
+                     if text.len() > 20000 {
+                        format!("{}\n... (truncated)", &text[..20000])
+                    } else {
+                        text
+                    }
+                });
+            }
             if !response.status().is_success() {
                 return Err(anyhow::anyhow!("Failed to fetch URL: {}", response.status()));
             }
@@ -97,6 +120,7 @@ IMPORTANT:
 
         let response = client
             .get(&url)
+            .header("User-Agent", *user_agent)
             .query(&[
                 ("q", query), 
                 ("format", "json"), 
@@ -104,6 +128,17 @@ IMPORTANT:
                 ("categories", category)
             ])
             .send()?;
+
+        if response.status().as_u16() == 403 || response.status().as_u16() == 429 {
+             // Fallback to browser for search
+             // Construct the search URL manually for the browser
+             let browser_search_url = format!("{}?q={}&categories={}", url, urlencoding::encode(query), category);
+             return self.browser.get_content(&browser_search_url).map(|text| {
+                 // Try to format the raw text a bit or just return it
+                 // Since it's raw text from body, it might be messy but contains the results
+                 format!("(Fallback: Search via Browser due to 403)\n\n{}", text)
+             }).map_err(|e| anyhow::anyhow!("Search failed (403) and Browser fallback failed: {}", e));
+        }
 
         if !response.status().is_success() {
              return Err(anyhow::anyhow!("Search request failed: {}", response.status()));

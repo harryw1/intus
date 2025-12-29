@@ -16,7 +16,7 @@ async fn test_persistence_lifecycle() {
     config.system_prompt = "Sys".to_string();
 
     // 2. User sends message
-    let mut app = App::new(tx.clone(), config.clone(), true, Some(file_path.clone()));
+    let mut app = App::init(tx.clone(), config.clone(), false, Some(file_path.clone())).await;
     app.models = vec!["test".to_string()]; // Mock models for RequestAiResponse
     assert!(app.messages.is_empty());
 
@@ -51,7 +51,7 @@ async fn test_persistence_lifecycle() {
     assert!(content_final.contains("Thinking..."));
 
     // 5. Reload
-    let app2 = App::new(tx.clone(), config.clone(), true, Some(file_path.clone()));
+    let app2 = App::init(tx.clone(), config.clone(), false, Some(file_path.clone())).await;
     assert_eq!(app2.messages.len(), 2);
     assert_eq!(app2.messages[1].content, "Thinking...");
 }
@@ -70,7 +70,7 @@ async fn test_prepare_quit_saves_session() {
     config.context_token_limit = 100;
     config.system_prompt = "Sys".to_string();
 
-    let mut app = App::new(tx.clone(), config.clone(), false, Some(file_path.clone()));
+    let mut app = App::init(tx.clone(), config.clone(), false, Some(file_path.clone())).await;
     app.models = vec!["test".to_string()];
 
     // Add a message (which triggers its own save, but we're testing PrepareQuit specifically)
@@ -115,7 +115,7 @@ async fn test_atomic_write_creates_backup() {
     config.system_prompt = "Sys".to_string();
 
     // Create initial session with content
-    let mut app = App::new(tx.clone(), config.clone(), false, Some(file_path.clone()));
+    let mut app = App::init(tx.clone(), config.clone(), false, Some(file_path.clone())).await;
     app.models = vec!["test".to_string()];
     app.update(Action::AddUserMessage("First Message".to_string()))
         .await;

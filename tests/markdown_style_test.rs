@@ -1,5 +1,4 @@
-use ratatui::text::Text;
-
+use ratatui::style::{Color, Modifier, Style};
 #[test]
 fn test_markdown_styling() {
     let markdown = "This is **bold** and 1. numbered list";

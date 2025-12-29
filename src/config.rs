@@ -7,43 +7,70 @@ use tracing::{info, warn};
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Config {
+    /// Base URL for the Ollama API (e.g., "http://localhost:11434").
     #[serde(default = "default_ollama_url")]
     pub ollama_url: String,
+    
+    /// Type of API to use ("ollama" or "openai").
     #[serde(default = "default_api_type")]
-    pub api_type: String, // "ollama" or "openai"
+    pub api_type: String, 
+    
+    /// Optional API Key for OpenAI-compatible endpoints.
     #[serde(default)]
     pub api_key: String,
+    
+    /// Maximum number of tokens for the context window.
     #[serde(default = "default_context_token_limit")]
     pub context_token_limit: usize,
+    
+    /// The default system prompt to use for new sessions.
     #[serde(default = "default_system_prompt")]
     pub system_prompt: String,
+    
+    /// List of file/directory patterns to ignore in file operations.
     #[serde(default = "default_ignored_patterns")]
     pub ignored_patterns: Vec<String>,
-    /// Whether to automatically detect optimal context size based on system resources
+    
+    /// Whether to automatically detect optimal context size based on system resources.
     #[serde(default = "default_auto_context")]
     pub auto_context: bool,
-    /// Whether to enable automatic conversation summarization
+    
+    /// Whether to enable automatic conversation summarization.
     #[serde(default = "default_summarization_enabled")]
     pub summarization_enabled: bool,
-    /// Threshold (0.0-1.0) at which to trigger summarization
+    
+    /// Threshold (0.0-1.0) at which to trigger summarization.
     #[serde(default = "default_summarization_threshold")]
     pub summarization_threshold: f32,
+    
+    /// URL for the SearXNG instance used for web searches.
     #[serde(default = "default_searxng_url")]
     pub searxng_url: String,
+    
+    /// Name of the model to use for generating embeddings.
     #[serde(default = "default_embedding_model")]
     pub embedding_model: String,
+    
+    /// Maximum number of consecutive tool calls allowed before stopping.
     #[serde(default = "default_max_consecutive_tool_calls")]
     pub max_consecutive_tool_calls: usize,
+    
+    /// Maximum number of messages to keep in the conversation history.
     #[serde(default = "default_max_history_messages")]
     pub max_history_messages: usize,
-    /// Optional location string (e.g. "New York, USA") for context-aware responses
+    
+    /// Optional location string (e.g. "New York, USA") for context-aware responses.
     pub location: Option<String>,
-    /// Whether to enable automatic IP-based geolocation (privacy warning: exposes IP to third-party)
+    
+    /// Whether to enable automatic IP-based geolocation (privacy warning: exposes IP to third-party).
     #[serde(default = "default_enable_geolocation")]
     pub enable_geolocation: bool,
-    /// Map of named knowledge bases to their directory paths (e.g. "work" -> "~/Documents/Work")
+    
+    /// Map of named knowledge bases to their directory paths (e.g. "work" -> "~/Documents/Work").
     #[serde(default = "default_knowledge_bases")]
     pub knowledge_bases: HashMap<String, String>,
+    
+    /// Whether to enable automatic session renaming based on conversation content.
     #[serde(default = "default_enable_session_autonaming")]
     pub enable_session_autonaming: bool,
 }
@@ -94,12 +121,13 @@ fn default_system_prompt() -> String {
 ## CORE INSTRUCTIONS
 1. **ENVIRONMENT AWARENESS**: On your first turn in a new session, or if you are unsure about the user's setup, proactively check for available tools using `run_command` (e.g., `which brew`, `which uv`, `which cargo`). This helps you use the user's preferred workflows (e.g., using `uv` for Python instead of plain `python3`).
 2. **PROACTIVE CLARIFICATION**: If a user's request is vague (e.g., "Search my notes" or "Find that file"), **DO NOT GUESS**. Ask clarifying questions: "Which notes? Work or Personal?" or "What topic are you looking for?".
-2. **ACTION FIRST**: When the task is clear, use tools IMMEDIATELY. Do not plan out loud unless the task is complex.
-3. **NO HALLUCINATIONS**: ONLY use the tools listed below. Do not invent tools.
-4. **INTERNAL MONOLOGUE**: Before taking complex actions or answering difficult questions, use `<thought>` tags to plan your approach or analyze the problem. For example: `<thought>I need to check the file structure first.</thought>`. The user receives this as a distinct UI element.
-5. **VERIFY**: Check file contents (`read_file`) before editing.
-6. **ARGUMENTS**: Provide exact arguments. Do not use placeholders.
-7. **AVOID LOOPS**: If a tool fails or returns the same results, try a DIFFERENT strategy or ASK the user. Do not repeatedly run the same search.
+3. **ACTION FIRST**: When the task is clear, use tools IMMEDIATELY. Do not plan out loud unless the task is complex.
+4. **NO HALLUCINATIONS**: ONLY use the tools listed below. Do not invent tools.
+5. **REAL-TIME DATA**: You do not have internal knowledge of current events, weather, or time-sensitive data. You MUST use `web_search` for these queries. **DO NOT GUESS**. If you are asked about the weather, news, or recent updates, you MUST use a tool.
+6. **INTERNAL MONOLOGUE**: Before taking complex actions or answering difficult questions, use `<thought>` tags to plan your approach or analyze the problem. For example: `<thought>I need to check the file structure first.</thought>`. The user receives this as a distinct UI element.
+7. **VERIFY**: Check file contents (`read_file`) before editing.
+8. **ARGUMENTS**: Provide exact arguments. Do not use placeholders.
+9. **AVOID LOOPS**: If a tool fails or returns the same results, try a DIFFERENT strategy or ASK the user. Do not repeatedly run the same search.
 
 ## KNOWLEDGE BASES & SEARCH
 - You can access named knowledge bases (directories) via `semantic_search`.

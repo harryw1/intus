@@ -33,11 +33,15 @@ pub struct ChatMessage {
     /// Name of the tool when role is "tool" (for tool response messages).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
+    /// ID of the tool call (required for OpenAI tool responses).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
     /// Internal thought process (monologue) separate from content.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thought: Option<String>,
 }
 
+/// Represents a request to the chat API.
 #[derive(Serialize)]
 struct ChatRequest {
     model: String,
@@ -59,6 +63,9 @@ pub struct ChatMessageRequest {
     /// Name of the tool when role is "tool" (for tool response messages)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
+    /// ID of the tool call (required for OpenAI tool responses)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -84,12 +91,32 @@ struct OpenAiChatChunk {
 #[derive(Deserialize)]
 struct OpenAiChoice {
     delta: OpenAiDelta,
+    #[allow(dead_code)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct OpenAiDelta {
     content: Option<String>,
-    tool_calls: Option<Vec<ToolCall>>,
+    tool_calls: Option<Vec<OpenAiToolCallChunk>>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiToolCallChunk {
+    #[allow(dead_code)]
+    index: Option<usize>,
+    #[allow(dead_code)]
+    id: Option<String>,
+    #[allow(dead_code)]
+    #[serde(rename = "type")]
+    type_: Option<String>,
+    function: Option<OpenAiFunctionChunk>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiFunctionChunk {
+    name: Option<String>,
+    arguments: Option<String>,
 }
 
 
@@ -201,6 +228,8 @@ pub struct RunningModel {
 }
 
 // Tooling Structures
+
+/// Defines a tool available to the model.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct ToolDefinition {
     #[serde(rename = "type")]
@@ -208,6 +237,7 @@ pub struct ToolDefinition {
     pub function: ToolFunction,
 }
 
+/// Defines the function signature of a tool.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct ToolFunction {
     pub name: String,
@@ -215,11 +245,21 @@ pub struct ToolFunction {
     pub parameters: serde_json::Value,
 }
 
+/// Represents a request by the model to call a tool.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct ToolCall {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default = "default_tool_type", rename = "type")]
+    pub type_: String,
     pub function: ToolCallFunction,
 }
 
+fn default_tool_type() -> String {
+    "function".to_string()
+}
+
+/// Details of the function call requested by the model.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct ToolCallFunction {
     pub name: String,
@@ -450,6 +490,8 @@ impl OllamaClient {
             tokio::spawn(async move {
                 let mut stream = stream;
                 let mut buffer = Vec::new();
+                // Map index -> (id, type, name, args)
+                let mut accumulated_tool_calls: HashMap<usize, (String, String, String, String)> = HashMap::new();
 
                 while let Some(chunk_result) = stream.next().await {
                      match chunk_result {
@@ -471,9 +513,27 @@ impl OllamaClient {
                                                        let _ = tx.send(Ok(ChatStreamEvent::Token(content.clone())));
                                                    }
                                                }
+                                               
                                                if let Some(tool_calls) = &choice.delta.tool_calls {
-                                                   for call in tool_calls {
-                                                       let _ = tx.send(Ok(ChatStreamEvent::ToolCall(call.clone())));
+                                                   for call_chunk in tool_calls {
+                                                       let idx = call_chunk.index.unwrap_or(0);
+                                                       let entry = accumulated_tool_calls.entry(idx).or_insert((String::new(), "function".to_string(), String::new(), String::new()));
+                                                       
+                                                       if let Some(id) = &call_chunk.id {
+                                                           entry.0 = id.clone();
+                                                       }
+                                                       if let Some(t) = &call_chunk.type_ {
+                                                           entry.1 = t.clone();
+                                                       }
+                                                       
+                                                       if let Some(func) = &call_chunk.function {
+                                                           if let Some(name) = &func.name {
+                                                               entry.2.push_str(name);
+                                                           }
+                                                           if let Some(args) = &func.arguments {
+                                                               entry.3.push_str(args);
+                                                           }
+                                                       }
                                                    }
                                                }
                                            }
@@ -486,6 +546,22 @@ impl OllamaClient {
                             return;
                         }
                      }
+                }
+                
+                // After stream ends, emit all accumulated tool calls
+                for (_, (id, type_, name, args)) in accumulated_tool_calls {
+                    if !name.is_empty() {
+                        let parsed_args = serde_json::from_str(&args).unwrap_or(serde_json::json!({}));
+                        let tool_call = ToolCall {
+                            id: if id.is_empty() { None } else { Some(id) },
+                            type_: if type_.is_empty() { "function".to_string() } else { type_ },
+                            function: ToolCallFunction {
+                                name,
+                                arguments: parsed_args,
+                            }
+                        };
+                        let _ = tx.send(Ok(ChatStreamEvent::ToolCall(tool_call)));
+                    }
                 }
             });
 
@@ -699,6 +775,7 @@ mod tests {
             images: None,
             tool_calls: None,
             tool_name: None,
+            tool_call_id: None,
         }];
         let mut stream = client
             .chat("llama2", messages, None, None)
@@ -733,6 +810,7 @@ mod tests {
             images: None,
             tool_calls: None,
             tool_name: None,
+            tool_call_id: None,
         }];
         let result = client.chat("llama2", messages, None, None).await;
 

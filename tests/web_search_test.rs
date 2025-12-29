@@ -1,4 +1,6 @@
 use intus::tools::{Tool, WebSearchTool};
+use intus::rag::RagSystem;
+use std::sync::{Arc, Mutex};
 use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -22,15 +24,18 @@ async fn test_web_search_url_fetching() {
     // We wrap execution in spawn_blocking because WebSearchTool uses reqwest::blocking
     // and we are in an async runtime.
     let result = tokio::task::spawn_blocking(move || {
+        let rag = Arc::new(RagSystem::new(
+            intus::ollama::OllamaClient::new("http://localhost".to_string(), "ollama".to_string(), "".to_string()),
+            "dummy".to_string(),
+            Arc::new(Mutex::new(None)),
+            None,
+        ));
+
         let tool = WebSearchTool {
             searxng_url: "http://localhost:8080".to_string(),
             client: std::sync::OnceLock::new(),
-    let rag = Arc::new(RagSystem::new(
-        intus::ollama::OllamaClient::new("http://localhost".to_string(), "ollama".to_string(), "".to_string()),
-        "dummy".to_string(),
-        Arc::new(Mutex::new(None)),
-        None,
-    ));
+            rag,
+            browser: Arc::new(intus::tools::web::BrowserClient::new()),
         };
 
         let args = json!({

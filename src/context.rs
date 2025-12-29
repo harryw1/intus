@@ -167,6 +167,7 @@ SUMMARY:"#,
                 images: None,
                 tool_calls: None,
                 tool_name: None,
+                tool_call_id: None,
             },
             ChatMessageRequest {
                 role: "user".to_string(),
@@ -174,6 +175,7 @@ SUMMARY:"#,
                 images: None,
                 tool_calls: None,
                 tool_name: None,
+                tool_call_id: None,
             },
         ]
     }
@@ -236,6 +238,7 @@ mod tests {
                 images: None,
                 tool_calls: None,
                 tool_name: None,
+                tool_call_id: None,
                 thought: None,
             },
             ChatMessage {
@@ -244,6 +247,7 @@ mod tests {
                 images: None,
                 tool_calls: None,
                 tool_name: None,
+                tool_call_id: None,
                 thought: None,
             },
         ];
@@ -263,6 +267,7 @@ mod tests {
                 images: None,
                 tool_calls: None,
                 tool_name: None,
+                tool_call_id: None,
                 thought: None,
             },
             ChatMessage {
@@ -271,6 +276,7 @@ mod tests {
                 images: None,
                 tool_calls: None,
                 tool_name: None,
+                tool_call_id: None,
                 thought: None,
             },
             ChatMessage {
@@ -279,6 +285,7 @@ mod tests {
                 images: None,
                 tool_calls: None,
                 tool_name: None,
+                tool_call_id: None,
                 thought: None,
             },
             ChatMessage {
@@ -287,6 +294,7 @@ mod tests {
                 images: None,
                 tool_calls: None,
                 tool_name: None,
+                tool_call_id: None,
                 thought: None,
             },
         ];
@@ -308,6 +316,7 @@ mod tests {
             images: None,
             tool_calls: None,
             tool_name: None,
+            tool_call_id: None,
             thought: None,
         }];
 
